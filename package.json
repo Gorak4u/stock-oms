@@ -1,0 +1,23 @@
+{
+  "name": "ai-trading-platform",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Resilient, auditable, single-user automated NSE trading platform",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "backtest": "ts-node scripts/run-backtest.ts"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.12",
+    "@types/node": "^20.14.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.2",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.0"
+  }
+}
