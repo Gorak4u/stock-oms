@@ -92,14 +92,31 @@ src/
 
 ```bash
 npm install
-npm run typecheck     # tsc --noEmit
-npm test              # 276 tests
-npm run backtest      # runnable demo over a synthetic series
+npm run typecheck      # tsc --noEmit
+npm test               # 294 tests
+npm run backtest       # runnable demo over a synthetic series
+npm run build:console  # dist/console.html — interactive, open in a browser
 ```
 
 Requires Node 20+. The core has **zero runtime dependencies** — only dev
 tooling. That is deliberate: the deterministic path should not be able to break
 because a transitive dependency changed.
+
+## The backtest console
+
+`npm run build:console` produces a single self-contained `dist/console.html`.
+Open it directly — no server, no network. It runs the **real engine** compiled
+to the browser: the same strategy, risk, sizing, cost and fill code the Node
+build uses, so a result there matches `npm run backtest` exactly.
+
+You can change strategy and parameters, adjust the risk limits, toggle costs and
+trailing stops, run against a seeded synthetic series or paste your own OHLC CSV,
+and walk-forward validate. It also surfaces the things a returns chart hides:
+which risk control refused each signal, and whether the audit chain verifies.
+
+`node:crypto` is aliased to a pure-JS SHA-256 for the browser bundle so the audit
+chain hashes identically in both environments — `__tests__/cryptoShim.test.ts`
+asserts the two agree byte for byte, including at the padding boundaries.
 
 ## The workflow
 

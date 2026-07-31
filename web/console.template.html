@@ -1,0 +1,895 @@
+<title>Backtest Console — AI Trading Platform</title>
+
+<style>
+  :root {
+    color-scheme: light;
+    --plane:        #f4f5f7;
+    --surface:      #fbfbfc;
+    --surface-2:    #eef0f3;
+    --ink:          #0e1116;
+    --ink-2:        #414b57;
+    --muted:        #5c6672;
+    --hairline:     #dde1e7;
+    --grid:         #e6e9ee;
+    --baseline:     #c3c9d2;
+    --accent:       #2a78d6;
+    --accent-soft:  rgba(42,120,214,0.13);
+    --good:         #0ca30c;
+    --good-ink:     #056b05;
+    --critical:     #d03b3b;
+    --critical-soft:rgba(208,59,59,0.15);
+    --warning:      #b47600;
+    --ring:         rgba(14,17,22,0.10);
+    --shadow:       0 1px 2px rgba(14,17,22,0.05), 0 8px 24px -12px rgba(14,17,22,0.12);
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --plane:        #0d0f12;
+      --surface:      #14161a;
+      --surface-2:    #1c1f25;
+      --ink:          #f2f4f7;
+      --ink-2:        #b9c1cc;
+      --muted:        #98a2ae;
+      --hairline:     #262a31;
+      --grid:         #22262c;
+      --baseline:     #343943;
+      --accent:       #3987e5;
+      --accent-soft:  rgba(57,135,229,0.18);
+      --good:         #0ca30c;
+      --good-ink:     #34c134;
+      --critical:     #e66767;
+      --critical-soft:rgba(230,103,103,0.18);
+      --warning:      #fab219;
+      --ring:         rgba(255,255,255,0.10);
+      --shadow:       0 1px 2px rgba(0,0,0,0.4), 0 8px 24px -12px rgba(0,0,0,0.6);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --plane:        #0d0f12;
+    --surface:      #14161a;
+    --surface-2:    #1c1f25;
+    --ink:          #f2f4f7;
+    --ink-2:        #b9c1cc;
+    --muted:        #98a2ae;
+    --hairline:     #262a31;
+    --grid:         #22262c;
+    --baseline:     #343943;
+    --accent:       #3987e5;
+    --accent-soft:  rgba(57,135,229,0.18);
+    --good:         #0ca30c;
+    --good-ink:     #34c134;
+    --critical:     #e66767;
+    --critical-soft:rgba(230,103,103,0.18);
+    --warning:      #fab219;
+    --ring:         rgba(255,255,255,0.10);
+    --shadow:       0 1px 2px rgba(0,0,0,0.4), 0 8px 24px -12px rgba(0,0,0,0.6);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--plane);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 15px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0;
+  }
+
+  /* ---------- shell ---------- */
+
+  .masthead {
+    border-bottom: 1px solid var(--hairline);
+    background: var(--surface);
+    padding: 20px 28px;
+  }
+  .masthead-inner {
+    max-width: 1400px; margin: 0 auto;
+    display: flex; flex-wrap: wrap; gap: 16px;
+    align-items: baseline; justify-content: space-between;
+  }
+  .masthead h1 {
+    margin: 4px 0 0; font-size: 21px; font-weight: 620; letter-spacing: -0.015em;
+    text-wrap: balance;
+  }
+  .masthead p { margin: 6px 0 0; color: var(--ink-2); font-size: 13.5px; max-width: 62ch; }
+
+  .shell {
+    max-width: 1400px; margin: 0 auto; padding: 24px 28px 72px;
+    display: grid; grid-template-columns: 328px minmax(0, 1fr); gap: 24px;
+    align-items: start;
+  }
+  @media (max-width: 1040px) { .shell { grid-template-columns: minmax(0, 1fr); } }
+
+  /* ---------- panels ---------- */
+
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--hairline);
+    border-radius: 10px;
+    box-shadow: var(--shadow);
+  }
+  .panel + .panel { margin-top: 18px; }
+  .panel-head {
+    padding: 13px 16px; border-bottom: 1px solid var(--hairline);
+    display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+  }
+  .panel-head h2 { margin: 0; font-size: 13.5px; font-weight: 620; letter-spacing: -0.005em; }
+  .panel-body { padding: 16px; }
+
+  .rail { position: sticky; top: 20px; }
+  @media (max-width: 1040px) { .rail { position: static; } }
+
+  /* ---------- form ---------- */
+
+  .field { display: block; margin-bottom: 13px; }
+  .field:last-child { margin-bottom: 0; }
+  .field > span {
+    display: block; font-size: 11.5px; font-weight: 560; color: var(--ink-2);
+    margin-bottom: 5px; letter-spacing: 0.01em;
+  }
+  .hint { font-size: 11.5px; color: var(--muted); margin: 5px 0 0; line-height: 1.45; }
+
+  input[type="text"], input[type="number"], select, textarea {
+    width: 100%; padding: 7px 9px;
+    font-family: var(--sans); font-size: 13.5px;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink); background: var(--plane);
+    border: 1px solid var(--hairline); border-radius: 7px;
+  }
+  textarea { font-family: var(--mono); font-size: 12px; resize: vertical; min-height: 92px; }
+  input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px;
+  }
+
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .triple { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+
+  .check { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 9px; font-size: 13px; }
+  .check input { margin: 3px 0 0; accent-color: var(--accent); }
+
+  .seg { display: flex; gap: 0; border: 1px solid var(--hairline); border-radius: 7px; overflow: hidden; }
+  .seg button {
+    flex: 1; padding: 7px 4px; font-family: var(--sans); font-size: 12.5px; font-weight: 540;
+    background: var(--plane); color: var(--ink-2); border: 0; cursor: pointer;
+  }
+  .seg button + button { border-left: 1px solid var(--hairline); }
+  .seg button[aria-pressed="true"] { background: var(--accent); color: #fff; }
+
+  .actions { display: grid; gap: 8px; margin-top: 4px; }
+  .btn {
+    padding: 9px 14px; border-radius: 7px; border: 1px solid transparent;
+    font-family: var(--sans); font-size: 13.5px; font-weight: 580; cursor: pointer;
+  }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-secondary { background: var(--plane); color: var(--ink); border-color: var(--hairline); }
+  .btn[disabled] { opacity: 0.55; cursor: progress; }
+
+  /* ---------- status ---------- */
+
+  .status {
+    display: flex; align-items: center; gap: 9px; flex-wrap: wrap;
+    padding: 10px 14px; border-radius: 9px; margin-bottom: 18px;
+    border: 1px solid var(--hairline); background: var(--surface);
+    font-size: 13px; color: var(--ink-2);
+  }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex: none; }
+  .status.is-error { border-color: var(--critical); color: var(--critical); }
+  .status.is-error .dot { background: var(--critical); }
+
+  /* ---------- stat tiles ---------- */
+
+  /* Eight tiles on a four-column grid — two complete rows, no dead cells. */
+  .tiles {
+    display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px;
+    background: var(--hairline); border: 1px solid var(--hairline);
+    border-radius: 10px; overflow: hidden;
+  }
+  @media (max-width: 900px) { .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (max-width: 420px) { .tiles { grid-template-columns: minmax(0, 1fr); } }
+  .tile { background: var(--surface); padding: 13px 15px; }
+  .tile dt {
+    font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.07em;
+    text-transform: uppercase; color: var(--muted); margin: 0 0 6px;
+  }
+  .tile dd { margin: 0; font-size: 21px; font-weight: 600; letter-spacing: -0.02em; }
+  .tile .sub { font-size: 11.5px; color: var(--muted); font-weight: 450; letter-spacing: 0; }
+  .pos { color: var(--good-ink); }
+  .neg { color: var(--critical); }
+
+  /* ---------- charts ---------- */
+
+  .chart-wrap { position: relative; }
+  svg.chart { display: block; width: 100%; height: auto; }
+  .axis-label { font-family: var(--sans); font-size: 10.5px; fill: var(--muted); font-variant-numeric: tabular-nums; }
+  .grid-line { stroke: var(--grid); stroke-width: 1; }
+  .base-line { stroke: var(--baseline); stroke-width: 1; }
+
+  .tooltip {
+    position: absolute; pointer-events: none; opacity: 0;
+    transform: translate(-50%, -100%);
+    background: var(--surface); color: var(--ink);
+    border: 1px solid var(--ring); border-radius: 8px;
+    box-shadow: var(--shadow); padding: 8px 10px;
+    font-size: 12px; line-height: 1.5; white-space: nowrap; z-index: 5;
+    transition: opacity 0.09s ease;
+  }
+  .tooltip b { font-weight: 600; font-variant-numeric: tabular-nums; }
+  .tooltip .tt-date { color: var(--muted); font-family: var(--mono); font-size: 10.5px; }
+
+  /* ---------- tables ---------- */
+
+  .scroll { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td {
+    text-align: right; padding: 7px 10px;
+    border-bottom: 1px solid var(--hairline); white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  th:first-child, td:first-child { text-align: left; }
+  th {
+    font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--muted); font-weight: 500; position: sticky; top: 0; background: var(--surface);
+  }
+  tbody tr:last-child td { border-bottom: 0; }
+  .code { font-family: var(--mono); font-size: 11.5px; }
+  .tall { max-height: 320px; overflow-y: auto; }
+
+  .bar-cell { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
+  .bar { height: 8px; border-radius: 4px; background: var(--accent); flex: none; }
+
+  .badge {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 11.5px; font-weight: 560; padding: 2px 8px; border-radius: 20px;
+    border: 1px solid var(--ring);
+  }
+  .badge.ok { color: var(--good-ink); }
+  .badge.bad { color: var(--critical); }
+
+  .empty { color: var(--muted); font-size: 13px; padding: 8px 0; margin: 0; }
+
+  .note {
+    font-size: 12.5px; color: var(--ink-2); line-height: 1.55;
+    border-left: 2px solid var(--accent); padding-left: 12px; margin: 0;
+  }
+
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; align-items: start; }
+  @media (max-width: 760px) { .two-col { grid-template-columns: 1fr; } .triple { grid-template-columns: 1fr; } }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; animation: none !important; }
+  }
+</style>
+
+<header class="masthead">
+  <div class="masthead-inner">
+    <div>
+      <p class="eyebrow">AI Trading Platform · Backtest console</p>
+      <h1>Run the engine, not a mock-up</h1>
+      <p>
+        The platform core compiled to the browser — the same strategy, risk, sizing, cost and
+        fill code that runs under Node. Nothing is precomputed; every number below is produced
+        by a backtest executed on this page.
+      </p>
+    </div>
+    <div style="text-align:right">
+      <p class="eyebrow">Verify</p>
+      <p style="margin:6px 0 0;font-size:12.5px;color:var(--ink-2)">
+        Same seed → same result, every time.
+      </p>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+  <!-- ===================== CONTROL RAIL ===================== -->
+  <form class="rail" id="controls" autocomplete="off">
+    <div class="panel">
+      <div class="panel-head"><h2>Market data</h2></div>
+      <div class="panel-body">
+        <div class="seg" role="group" aria-label="Data source">
+          <button type="button" id="src-synth" aria-pressed="true">Synthetic</button>
+          <button type="button" id="src-csv" aria-pressed="false">Your CSV</button>
+        </div>
+
+        <div id="synth-fields" style="margin-top:13px">
+          <div class="pair">
+            <label class="field"><span>Bars</span>
+              <input type="number" id="bars" value="1250" min="120" max="6000" step="10">
+            </label>
+            <label class="field"><span>Seed</span>
+              <input type="number" id="seed" value="42" min="1" max="999999">
+            </label>
+          </div>
+          <p class="hint">
+            A seeded generator, not <span class="code">Math.random</span> — the same seed always
+            reproduces the same series. 1250 bars ≈ five years of sessions.
+          </p>
+        </div>
+
+        <div id="csv-fields" hidden style="margin-top:13px">
+          <label class="field"><span>Paste OHLC CSV</span>
+            <textarea id="csv" placeholder="date,open,high,low,close,volume
+2024-01-01,2500.00,2540.00,2490.00,2532.10,1840000
+2024-01-02,2532.10,2559.00,2521.35,2548.75,1620000"></textarea>
+          </label>
+          <p class="hint">
+            Header row required; <span class="code">date, open, high, low, close</span> in any
+            order, <span class="code">volume</span> optional. Rows failing candle validation are
+            reported, not silently dropped.
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h2>Strategy</h2></div>
+      <div class="panel-body">
+        <label class="field"><span>Model</span>
+          <select id="strategy">
+            <option value="trend">Trend following</option>
+            <option value="meanReversion">Mean reversion</option>
+            <option value="momentum">Momentum</option>
+            <option value="volatility">Volatility breakout</option>
+          </select>
+        </label>
+        <div id="params"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h2>Risk &amp; costs</h2></div>
+      <div class="panel-body">
+        <label class="field"><span>Opening capital (₹)</span>
+          <input type="number" id="capital" value="1000000" min="10000" step="10000">
+        </label>
+        <div class="pair">
+          <label class="field"><span>Risk / trade</span>
+            <input type="number" id="riskPerTrade" value="1" min="0.1" max="10" step="0.1">
+          </label>
+          <label class="field"><span>Max position</span>
+            <input type="number" id="maxPosition" value="10" min="1" max="100" step="1">
+          </label>
+        </div>
+        <div class="pair">
+          <label class="field"><span>Daily loss limit</span>
+            <input type="number" id="dailyLoss" value="3" min="0.5" max="50" step="0.5">
+          </label>
+          <label class="field"><span>Max drawdown</span>
+            <input type="number" id="maxDD" value="15" min="1" max="90" step="1">
+          </label>
+        </div>
+        <p class="hint" style="margin-bottom:12px">All four are percentages of equity.</p>
+
+        <label class="check">
+          <input type="checkbox" id="costs" checked>
+          <span>Charge brokerage, STT, GST, stamp duty &amp; slippage</span>
+        </label>
+        <label class="check">
+          <input type="checkbox" id="trailing" checked>
+          <span>Trail stops toward profit</span>
+        </label>
+        <label class="check">
+          <input type="checkbox" id="requireStop" checked>
+          <span>Require a protective stop on every entry</span>
+        </label>
+
+        <div class="actions">
+          <button type="button" class="btn btn-primary" id="run">Run backtest</button>
+          <button type="button" class="btn btn-secondary" id="walk">Walk-forward validate</button>
+        </div>
+      </div>
+    </div>
+  </form>
+
+  <!-- ===================== RESULTS ===================== -->
+  <main>
+    <div class="status" id="status" role="status" aria-live="polite">
+      <span class="dot"></span><span id="status-text">Ready — press Run backtest.</span>
+    </div>
+
+    <dl class="tiles" id="tiles"></dl>
+
+    <div class="panel" id="chart-panel" hidden>
+      <div class="panel-head">
+        <h2>Equity</h2>
+        <span class="eyebrow" id="chart-meta"></span>
+      </div>
+      <div class="panel-body">
+        <div class="chart-wrap" id="equity-wrap">
+          <svg class="chart" id="equity-chart" viewBox="0 0 900 260" preserveAspectRatio="none" role="img"
+               aria-label="Account equity over the backtest period"></svg>
+          <div class="tooltip" id="tooltip"></div>
+        </div>
+        <div class="chart-wrap" style="margin-top:2px">
+          <svg class="chart" id="dd-chart" viewBox="0 0 900 130" preserveAspectRatio="none" role="img"
+               aria-label="Drawdown from peak equity over the backtest period"></svg>
+        </div>
+        <p class="hint" style="margin-top:10px">
+          Two charts, one x-axis — equity in rupees above, drawdown from peak below. Deliberately
+          not a dual-axis chart: two scales on one frame make any crossing point meaningless.
+        </p>
+      </div>
+    </div>
+
+    <div class="panel" id="wf-panel" hidden>
+      <div class="panel-head"><h2>Walk-forward validation</h2><span class="eyebrow" id="wf-meta"></span></div>
+      <div class="panel-body">
+        <p class="note" id="wf-verdict"></p>
+        <div class="scroll" style="margin-top:14px">
+          <table>
+            <thead><tr>
+              <th>Fold</th><th>Parameters chosen in-sample</th><th>In-sample</th><th>Out-of-sample</th>
+            </tr></thead>
+            <tbody id="wf-rows"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="two-col" id="detail" hidden style="margin-top:18px">
+      <div class="panel" style="margin-top:0">
+        <div class="panel-head"><h2>Why orders were refused</h2></div>
+        <div class="panel-body">
+          <div id="rejections"></div>
+          <p class="hint" style="margin-top:12px">
+            Signals the risk layer declined, by control. An empty list means every signal that
+            passed the strategy also cleared risk.
+          </p>
+        </div>
+      </div>
+
+      <div class="panel" style="margin-top:0">
+        <div class="panel-head">
+          <h2>Audit trail</h2>
+          <span id="audit-badge"></span>
+        </div>
+        <div class="panel-body">
+          <div id="audit"></div>
+          <p class="hint" style="margin-top:12px">
+            Every decision is written to a hash-chained log. The badge re-derives each hash and
+            checks the chain — an edited or removed record breaks it.
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel" id="trades-panel" hidden>
+      <div class="panel-head"><h2>Closed trades</h2><span class="eyebrow" id="trades-meta"></span></div>
+      <div class="panel-body" style="padding-top:0">
+        <div class="scroll tall">
+          <table>
+            <thead><tr>
+              <th>Closed</th><th>Side</th><th>Qty</th><th>Entry</th><th>Exit</th><th>Net P&amp;L</th>
+            </tr></thead>
+            <tbody id="trade-rows"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>/*__ENGINE__*/</script>
+
+<script>
+(function () {
+  "use strict";
+
+  var $ = function (id) { return document.getElementById(id); };
+  var fmtPct = function (v) { return (v * 100).toFixed(2) + "%"; };
+  var fmtDate = function (t) {
+    return new Date(t).toISOString().slice(0, 10);
+  };
+  var signClass = function (v) { return v > 0 ? "pos" : v < 0 ? "neg" : ""; };
+
+  // ---- strategy parameter definitions -------------------------------------
+  var PARAMS = {
+    trend: [
+      { key: "fastPeriod", label: "Fast EMA", value: 20, min: 3, max: 100 },
+      { key: "slowPeriod", label: "Slow EMA", value: 50, min: 5, max: 300 },
+      { key: "atrStopMultiplier", label: "ATR stop ×", value: 2.5, min: 0.5, max: 10, step: 0.5 }
+    ],
+    meanReversion: [
+      { key: "lookback", label: "Lookback", value: 20, min: 5, max: 120 },
+      { key: "entryZ", label: "Entry z-score", value: 2, min: 0.5, max: 5, step: 0.25 }
+    ],
+    momentum: [
+      { key: "channelPeriod", label: "Entry channel", value: 55, min: 10, max: 250 },
+      { key: "exitChannelPeriod", label: "Exit channel", value: 20, min: 5, max: 200 }
+    ],
+    volatility: [
+      { key: "bandPeriod", label: "Band period", value: 20, min: 5, max: 120 },
+      { key: "squeezeLookback", label: "Squeeze window", value: 100, min: 20, max: 400 }
+    ]
+  };
+
+  function renderParams() {
+    var defs = PARAMS[$("strategy").value];
+    var html = '<div class="' + (defs.length === 3 ? "triple" : "pair") + '">';
+    defs.forEach(function (d) {
+      html += '<label class="field"><span>' + d.label + "</span>" +
+        '<input type="number" data-param="' + d.key + '" value="' + d.value +
+        '" min="' + d.min + '" max="' + d.max + '" step="' + (d.step || 1) + '"></label>';
+    });
+    $("params").innerHTML = html + "</div>";
+  }
+
+  function readParams() {
+    var out = {};
+    Array.prototype.forEach.call($("params").querySelectorAll("[data-param]"), function (el) {
+      var n = Number(el.value);
+      if (isFinite(n) && n > 0) out[el.getAttribute("data-param")] = n;
+    });
+    return out;
+  }
+
+  // ---- data source toggle --------------------------------------------------
+  var source = "synth";
+  function setSource(next) {
+    source = next;
+    $("src-synth").setAttribute("aria-pressed", String(next === "synth"));
+    $("src-csv").setAttribute("aria-pressed", String(next === "csv"));
+    $("synth-fields").hidden = next !== "synth";
+    $("csv-fields").hidden = next !== "csv";
+  }
+  $("src-synth").addEventListener("click", function () { setSource("synth"); });
+  $("src-csv").addEventListener("click", function () { setSource("csv"); });
+
+  function setStatus(text, isError) {
+    $("status-text").textContent = text;
+    $("status").classList.toggle("is-error", !!isError);
+  }
+
+  // ---- gather a run request ------------------------------------------------
+  function buildRequest() {
+    var candles, note;
+
+    if (source === "csv") {
+      var parsed = TP.parseCsv($("csv").value || "");
+      if (parsed.candles.length < 120) {
+        var why = parsed.errors.length
+          ? parsed.errors.join(" ")
+          : "Need at least 120 valid rows to warm up the indicators; got " + parsed.candles.length + ".";
+        return { error: why };
+      }
+      candles = parsed.candles;
+      note = candles.length + " bars from your CSV" +
+        (parsed.skipped ? " (" + parsed.skipped + " rows rejected by validation)" : "");
+    } else {
+      var bars = Math.max(120, Math.min(6000, Number($("bars").value) || 1250));
+      var seed = Number($("seed").value) || 42;
+      candles = TP.syntheticSeries(bars, seed);
+      note = bars + " synthetic bars, seed " + seed;
+    }
+
+    return {
+      note: note,
+      request: {
+        strategy: $("strategy").value,
+        params: readParams(),
+        candles: candles,
+        openingCash: Math.max(10000, Number($("capital").value) || 1000000),
+        limits: {
+          riskPerTradeFraction: (Number($("riskPerTrade").value) || 1) / 100,
+          maxPositionFraction: (Number($("maxPosition").value) || 10) / 100,
+          dailyLossLimitFraction: (Number($("dailyLoss").value) || 3) / 100,
+          maxDrawdownFraction: (Number($("maxDD").value) || 15) / 100,
+          requireStopLoss: $("requireStop").checked
+        },
+        applyCosts: $("costs").checked,
+        slippageFraction: $("costs").checked ? 0.0005 : 0,
+        trailingStops: $("trailing").checked
+      }
+    };
+  }
+
+  // ---- stat tiles ----------------------------------------------------------
+  function renderTiles(s) {
+    var tiles = [
+      { label: "Total return", value: fmtPct(s.totalReturn), cls: signClass(s.totalReturn),
+        sub: s.openingEquity + " → " + s.closingEquity },
+      { label: "CAGR", value: fmtPct(s.cagr), cls: signClass(s.cagr) },
+      { label: "Sharpe", value: s.sharpe.toFixed(2), cls: signClass(s.sharpe),
+        sub: "Sortino " + s.sortino.toFixed(2) },
+      { label: "Max drawdown", value: fmtPct(s.maxDrawdown), cls: s.maxDrawdown > 0 ? "neg" : "",
+        sub: s.maxDrawdownAmount },
+      { label: "Trades", value: String(s.tradeCount),
+        sub: fmtPct(s.winRate) + " won" },
+      { label: "Profit factor", value: s.profitFactor ? s.profitFactor.toFixed(2) : "—",
+        cls: s.profitFactor >= 1 ? "pos" : s.profitFactor > 0 ? "neg" : "",
+        sub: "Expectancy " + s.expectancy },
+      { label: "Worst streak", value: String(s.maxConsecutiveLosses),
+        sub: "consecutive losses" },
+      { label: "Time in market", value: fmtPct(s.exposureFraction) }
+    ];
+
+    $("tiles").innerHTML = tiles.map(function (t) {
+      return '<div class="tile"><dt>' + t.label + "</dt><dd" +
+        (t.cls ? ' class="' + t.cls + '"' : "") + ">" + t.value +
+        (t.sub ? '<div class="sub">' + t.sub + "</div>" : "") + "</dd></div>";
+    }).join("");
+  }
+
+  // ---- charts --------------------------------------------------------------
+  var PAD = { l: 62, r: 14, t: 14, b: 22 };
+
+  function niceTicks(min, max, count) {
+    var span = max - min;
+    if (span <= 0) return [min];
+    var raw = span / count;
+    var mag = Math.pow(10, Math.floor(Math.log10(raw)));
+    var step = mag;
+    [1, 2, 2.5, 5, 10].some(function (m) {
+      if (mag * m >= raw) { step = mag * m; return true; }
+      return false;
+    });
+    var out = [], v = Math.ceil(min / step) * step;
+    for (; v <= max + step * 0.001 && out.length < 12; v += step) out.push(v);
+    return out;
+  }
+
+  function compactRupees(v) {
+    var a = Math.abs(v);
+    if (a >= 1e7) return "₹" + (v / 1e7).toFixed(2) + "cr";
+    if (a >= 1e5) return "₹" + (v / 1e5).toFixed(2) + "L";
+    if (a >= 1e3) return "₹" + Math.round(v / 1e3) + "k";
+    return "₹" + Math.round(v);
+  }
+
+  var lastCurve = null, lastDrawdown = null;
+
+  function drawCharts(curve) {
+    var W = 900, H = 260, DH = 130;
+    var n = curve.length;
+    if (n < 2) return;
+
+    var lo = Infinity, hi = -Infinity;
+    curve.forEach(function (p) { if (p.equity < lo) lo = p.equity; if (p.equity > hi) hi = p.equity; });
+    var pad = (hi - lo) * 0.08 || Math.max(1, hi * 0.01);
+    lo -= pad; hi += pad;
+
+    // drawdown series, derived from the same curve
+    var peak = -Infinity;
+    var dd = curve.map(function (p) {
+      if (p.equity > peak) peak = p.equity;
+      return peak > 0 ? (p.equity - peak) / peak : 0;
+    });
+    var worst = Math.min.apply(null, dd);
+    lastCurve = curve; lastDrawdown = dd;
+
+    var x = function (i) { return PAD.l + (i / (n - 1)) * (W - PAD.l - PAD.r); };
+    var yE = function (v) { return PAD.t + (1 - (v - lo) / (hi - lo)) * (H - PAD.t - PAD.b); };
+    var ddSpan = Math.min(-0.0001, worst) * 1.15;
+    var yD = function (v) { return PAD.t + (v / ddSpan) * (DH - PAD.t - PAD.b); };
+
+    // ---- equity chart
+    var g = "";
+    niceTicks(lo, hi, 4).forEach(function (t) {
+      var yy = yE(t);
+      g += '<line class="grid-line" x1="' + PAD.l + '" y1="' + yy + '" x2="' + (W - PAD.r) + '" y2="' + yy + '"/>' +
+           '<text class="axis-label" x="' + (PAD.l - 8) + '" y="' + (yy + 3.5) + '" text-anchor="end">' +
+           compactRupees(t) + "</text>";
+    });
+
+    var line = "", area = "";
+    curve.forEach(function (p, i) {
+      line += (i ? "L" : "M") + x(i).toFixed(1) + " " + yE(p.equity).toFixed(1) + " ";
+    });
+    area = line + "L" + x(n - 1).toFixed(1) + " " + yE(lo) + " L" + PAD.l + " " + yE(lo) + " Z";
+
+    var openLevel = yE(curve[0].equity);
+    var ticksX = [0, Math.floor(n / 4), Math.floor(n / 2), Math.floor((3 * n) / 4), n - 1];
+    var xLabels = ticksX.map(function (i) {
+      return '<text class="axis-label" x="' + x(i) + '" y="' + (H - 5) + '" text-anchor="' +
+        (i === 0 ? "start" : i === n - 1 ? "end" : "middle") + '">' + fmtDate(curve[i].t) + "</text>";
+    }).join("");
+
+    $("equity-chart").innerHTML =
+      g +
+      '<path d="' + area + '" fill="var(--accent-soft)"/>' +
+      '<line class="base-line" x1="' + PAD.l + '" y1="' + openLevel + '" x2="' + (W - PAD.r) +
+        '" y2="' + openLevel + '" stroke-dasharray="3 3"/>' +
+      '<path d="' + line + '" fill="none" stroke="var(--accent)" stroke-width="2" ' +
+        'stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>' +
+      '<circle cx="' + x(n - 1) + '" cy="' + yE(curve[n - 1].equity) + '" r="4" fill="var(--accent)" ' +
+        'stroke="var(--surface)" stroke-width="2"/>' +
+      xLabels +
+      '<line id="cross-e" x1="0" y1="' + PAD.t + '" x2="0" y2="' + (H - PAD.b) +
+        '" stroke="var(--baseline)" stroke-width="1" opacity="0"/>';
+
+    // ---- drawdown chart
+    var dline = "", darea = "";
+    dd.forEach(function (v, i) {
+      dline += (i ? "L" : "M") + x(i).toFixed(1) + " " + yD(v).toFixed(1) + " ";
+    });
+    darea = dline + "L" + x(n - 1).toFixed(1) + " " + yD(0) + " L" + PAD.l + " " + yD(0) + " Z";
+
+    var dg = "";
+    [0, ddSpan / 2, ddSpan].forEach(function (t) {
+      var yy = yD(t);
+      dg += '<line class="grid-line" x1="' + PAD.l + '" y1="' + yy + '" x2="' + (W - PAD.r) + '" y2="' + yy + '"/>' +
+            '<text class="axis-label" x="' + (PAD.l - 8) + '" y="' + (yy + 3.5) + '" text-anchor="end">' +
+            (t * 100).toFixed(0) + "%</text>";
+    });
+
+    $("dd-chart").innerHTML =
+      dg +
+      '<path d="' + darea + '" fill="var(--critical-soft)"/>' +
+      '<path d="' + dline + '" fill="none" stroke="var(--critical)" stroke-width="2" ' +
+        'stroke-linejoin="round" vector-effect="non-scaling-stroke"/>' +
+      '<line id="cross-d" x1="0" y1="' + PAD.t + '" x2="0" y2="' + (DH - PAD.b) +
+        '" stroke="var(--baseline)" stroke-width="1" opacity="0"/>';
+  }
+
+  // ---- crosshair + tooltip -------------------------------------------------
+  (function attachHover() {
+    var wrap = $("equity-wrap"), tip = $("tooltip");
+
+    function hide() {
+      tip.style.opacity = "0";
+      var ce = document.getElementById("cross-e"), cd = document.getElementById("cross-d");
+      if (ce) ce.setAttribute("opacity", "0");
+      if (cd) cd.setAttribute("opacity", "0");
+    }
+
+    wrap.addEventListener("mousemove", function (e) {
+      if (!lastCurve) return;
+      var rect = wrap.getBoundingClientRect();
+      var frac = (e.clientX - rect.left) / rect.width;
+      var W = 900, plotL = PAD.l / W, plotR = (W - PAD.r) / W;
+      if (frac < plotL || frac > plotR) { hide(); return; }
+
+      var i = Math.round(((frac - plotL) / (plotR - plotL)) * (lastCurve.length - 1));
+      i = Math.max(0, Math.min(lastCurve.length - 1, i));
+      var p = lastCurve[i], d = lastDrawdown[i];
+
+      tip.innerHTML =
+        '<div class="tt-date">' + fmtDate(p.t) + "</div>" +
+        "<div>Equity <b>" + compactRupees(p.equity) + "</b></div>" +
+        '<div>Drawdown <b class="' + (d < -0.0001 ? "neg" : "") + '">' + (d * 100).toFixed(2) + "%</b></div>";
+      tip.style.opacity = "1";
+      tip.style.left = (e.clientX - rect.left) + "px";
+      tip.style.top = Math.max(52, e.clientY - rect.top - 12) + "px";
+
+      var xPix = (plotL + (i / (lastCurve.length - 1)) * (plotR - plotL)) * W;
+      ["cross-e", "cross-d"].forEach(function (id) {
+        var el = document.getElementById(id);
+        if (el) { el.setAttribute("x1", xPix); el.setAttribute("x2", xPix); el.setAttribute("opacity", "1"); }
+      });
+    });
+
+    wrap.addEventListener("mouseleave", hide);
+  })();
+
+  // ---- detail panels -------------------------------------------------------
+  function renderDetail(result) {
+    var maxR = result.rejections.reduce(function (m, r) { return Math.max(m, r.count); }, 0);
+    $("rejections").innerHTML = result.rejections.length
+      ? '<div class="scroll"><table><tbody>' + result.rejections.map(function (r) {
+          return "<tr><td class=\"code\">" + r.reason + '</td><td><div class="bar-cell">' +
+            '<span class="bar" style="width:' + Math.max(4, (r.count / maxR) * 92) + 'px"></span>' +
+            "<span>" + r.count + "</span></div></td></tr>";
+        }).join("") + "</tbody></table></div>"
+      : '<p class="empty">No signal was refused by the risk layer.</p>';
+
+    var maxA = result.auditEvents.reduce(function (m, a) { return Math.max(m, a.count); }, 0);
+    $("audit").innerHTML = '<div class="scroll"><table><tbody>' +
+      result.auditEvents.map(function (a) {
+        return "<tr><td class=\"code\">" + a.type + '</td><td><div class="bar-cell">' +
+          '<span class="bar" style="width:' + Math.max(4, (a.count / maxA) * 92) + 'px"></span>' +
+          "<span>" + a.count + "</span></div></td></tr>";
+      }).join("") + "</tbody></table></div>";
+
+    $("audit-badge").innerHTML = result.auditIntact
+      ? '<span class="badge ok">✓ Chain verified</span>'
+      : '<span class="badge bad">✕ Chain broken</span>';
+
+    var rows = result.trades.slice().reverse().slice(0, 300);
+    $("trade-rows").innerHTML = rows.length
+      ? rows.map(function (t) {
+          return "<tr><td>" + fmtDate(t.closedAt) + "</td><td>" + t.direction +
+            "</td><td>" + t.quantity + "</td><td>" + t.entry + "</td><td>" + t.exit +
+            '</td><td class="' + signClass(t.pnlValue) + '">' +
+            (t.pnlValue > 0 ? "▲ " : t.pnlValue < 0 ? "▼ " : "") + t.pnl + "</td></tr>";
+        }).join("")
+      : '<tr><td colspan="6" class="empty">No trade was opened and closed.</td></tr>';
+
+    $("trades-meta").textContent = result.trades.length +
+      (result.trades.length > 300 ? " closed · showing latest 300" : " closed");
+  }
+
+  // ---- run -----------------------------------------------------------------
+  function busy(on, label) {
+    $("run").disabled = on; $("walk").disabled = on;
+    if (on) setStatus(label, false);
+  }
+
+  $("run").addEventListener("click", function () {
+    var built = buildRequest();
+    if (built.error) { setStatus(built.error, true); return; }
+
+    busy(true, "Running backtest…");
+    setTimeout(function () {
+      TP.runBacktest(built.request).then(function (result) {
+        renderTiles(result.summary);
+        drawCharts(result.curve);
+        renderDetail(result);
+
+        $("chart-panel").hidden = false;
+        $("detail").hidden = false;
+        $("trades-panel").hidden = false;
+        $("chart-meta").textContent = built.note;
+
+        setStatus(
+          built.note + " · " + result.signalCount + " signals · " +
+          result.summary.tradeCount + " trades · audit chain " +
+          (result.auditIntact ? "verified" : "BROKEN"),
+          false
+        );
+        busy(false);
+      }).catch(function (err) {
+        setStatus("Backtest failed: " + (err && err.message ? err.message : err), true);
+        busy(false);
+      });
+    }, 16);
+  });
+
+  $("walk").addEventListener("click", function () {
+    var built = buildRequest();
+    if (built.error) { setStatus(built.error, true); return; }
+
+    var n = built.request.candles.length;
+    var trainBars = Math.floor(n * 0.32);
+    var testBars = Math.floor(n * 0.12);
+    if (trainBars + testBars > n) { setStatus("Series too short to validate.", true); return; }
+
+    busy(true, "Selecting parameters in-sample and testing out-of-sample…");
+    setTimeout(function () {
+      TP.runWalkForward(built.request, trainBars, testBars).then(function (wf) {
+        $("wf-rows").innerHTML = wf.folds.map(function (f) {
+          return "<tr><td>" + f.fold + '</td><td class="code">' + f.params +
+            '</td><td class="' + signClass(f.inSample) + '">' + fmtPct(f.inSample) +
+            '</td><td class="' + signClass(f.outOfSample) + '">' + fmtPct(f.outOfSample) + "</td></tr>";
+        }).join("");
+
+        var e = wf.efficiency;
+        var verdict = e >= 0.5
+          ? "Efficiency " + e.toFixed(2) + " — the edge largely survived out of sample."
+          : e > 0
+            ? "Efficiency " + e.toFixed(2) + " — most of the in-sample edge did not survive. Treat the parameters as fitted."
+            : "Efficiency " + e.toFixed(2) + " — the out-of-sample result contradicts the in-sample one. These parameters were fitted to noise and should not be traded.";
+
+        $("wf-verdict").textContent = verdict + " Aggregate out-of-sample return " +
+          fmtPct(wf.aggregateReturn) + ", Sharpe " + wf.aggregateSharpe.toFixed(2) + ".";
+        $("wf-meta").textContent = wf.folds.length + " folds · " + trainBars + " train / " + testBars + " test bars";
+        $("wf-panel").hidden = false;
+
+        setStatus("Walk-forward complete over " + wf.folds.length + " folds.", false);
+        busy(false);
+      }).catch(function (err) {
+        setStatus("Walk-forward failed: " + (err && err.message ? err.message : err), true);
+        busy(false);
+      });
+    }, 16);
+  });
+
+  $("strategy").addEventListener("change", renderParams);
+  renderParams();
+  $("run").click();
+})();
+</script>
