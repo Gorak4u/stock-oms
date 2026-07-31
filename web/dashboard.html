@@ -1,0 +1,500 @@
+<title>Trading Console</title>
+
+<style>
+  :root {
+    color-scheme: light;
+    --plane: #f4f5f7; --surface: #fbfbfc; --ink: #0e1116; --ink-2: #414b57;
+    --muted: #5c6672; --hairline: #dde1e7; --accent: #2a78d6;
+    --accent-soft: rgba(42,120,214,0.13);
+    --good: #0ca30c; --good-ink: #056b05; --critical: #d03b3b; --warning: #b47600;
+    --shadow: 0 1px 2px rgba(14,17,22,0.05), 0 8px 24px -12px rgba(14,17,22,0.12);
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --plane: #0d0f12; --surface: #14161a; --ink: #f2f4f7; --ink-2: #b9c1cc;
+      --muted: #98a2ae; --hairline: #262a31; --accent: #3987e5;
+      --accent-soft: rgba(57,135,229,0.18);
+      --good-ink: #34c134; --critical: #e66767; --warning: #fab219;
+      --shadow: 0 1px 2px rgba(0,0,0,0.4), 0 8px 24px -12px rgba(0,0,0,0.6);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --plane: #0d0f12; --surface: #14161a; --ink: #f2f4f7; --ink-2: #b9c1cc;
+    --muted: #98a2ae; --hairline: #262a31; --accent: #3987e5;
+    --accent-soft: rgba(57,135,229,0.18);
+    --good-ink: #34c134; --critical: #e66767; --warning: #fab219;
+    --shadow: 0 1px 2px rgba(0,0,0,0.4), 0 8px 24px -12px rgba(0,0,0,0.6);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--plane); color: var(--ink);
+    font-family: var(--sans); font-size: 15px; line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  .eyebrow {
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.09em;
+    text-transform: uppercase; color: var(--muted); margin: 0;
+  }
+
+  header {
+    background: var(--surface); border-bottom: 1px solid var(--hairline);
+    padding: 16px 24px; position: sticky; top: 0; z-index: 10;
+  }
+  .head-inner {
+    max-width: 1360px; margin: 0 auto; display: flex; gap: 16px;
+    align-items: center; justify-content: space-between; flex-wrap: wrap;
+  }
+  h1 { margin: 2px 0 0; font-size: 18px; font-weight: 620; letter-spacing: -0.01em; }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px; padding: 4px 11px;
+    border-radius: 20px; font-size: 12px; font-weight: 580;
+    border: 1px solid var(--hairline);
+  }
+  .pill .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .pill.live { color: var(--good-ink); }
+  .pill.halted { color: var(--critical); }
+  .pill.staged { color: var(--warning); }
+
+  main { max-width: 1360px; margin: 0 auto; padding: 22px 24px 64px; }
+
+  .tiles {
+    display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 1px;
+    background: var(--hairline); border: 1px solid var(--hairline);
+    border-radius: 10px; overflow: hidden; margin-bottom: 20px;
+  }
+  @media (max-width: 860px) { .tiles { grid-template-columns: repeat(2, minmax(0,1fr)); } }
+  .tile { background: var(--surface); padding: 13px 15px; }
+  .tile dt {
+    font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.07em;
+    text-transform: uppercase; color: var(--muted); margin: 0 0 5px;
+  }
+  .tile dd { margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -0.02em; }
+  .pos { color: var(--good-ink); } .neg { color: var(--critical); }
+
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; align-items: start; }
+  @media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
+
+  .panel {
+    background: var(--surface); border: 1px solid var(--hairline);
+    border-radius: 10px; box-shadow: var(--shadow); margin-bottom: 18px;
+  }
+  .panel-head {
+    padding: 12px 15px; border-bottom: 1px solid var(--hairline);
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  }
+  .panel-head h2 { margin: 0; font-size: 13.5px; font-weight: 620; }
+  .panel-body { padding: 15px; }
+
+  .controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  button {
+    font-family: var(--sans); font-size: 13px; font-weight: 560; cursor: pointer;
+    padding: 7px 13px; border-radius: 7px; border: 1px solid var(--hairline);
+    background: var(--plane); color: var(--ink);
+  }
+  button[aria-pressed="true"] { background: var(--accent); color: #fff; border-color: transparent; }
+  button.danger { color: #fff; background: var(--critical); border-color: transparent; }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button[disabled] { opacity: 0.5; cursor: not-allowed; }
+
+  input[type="password"], input[type="text"] {
+    padding: 7px 9px; font-family: var(--sans); font-size: 13px;
+    border: 1px solid var(--hairline); border-radius: 7px;
+    background: var(--plane); color: var(--ink); min-width: 210px;
+  }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td {
+    text-align: right; padding: 7px 9px; border-bottom: 1px solid var(--hairline);
+    white-space: nowrap; font-variant-numeric: tabular-nums;
+  }
+  th:first-child, td:first-child { text-align: left; }
+  th {
+    font-family: var(--mono); font-size: 10px; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--muted); font-weight: 500;
+  }
+  tbody tr:last-child td { border-bottom: 0; }
+  .scroll { overflow-x: auto; }
+  .tall { max-height: 300px; overflow-y: auto; }
+  .code { font-family: var(--mono); font-size: 11.5px; }
+  .empty { color: var(--muted); font-size: 13px; margin: 0; padding: 6px 0; }
+
+  svg.spark { display: block; width: 100%; height: auto; }
+
+  .toast {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    background: var(--surface); border: 1px solid var(--hairline);
+    box-shadow: var(--shadow); border-radius: 8px; padding: 10px 16px;
+    font-size: 13px; opacity: 0; pointer-events: none; transition: opacity 0.15s;
+    z-index: 50; max-width: 90vw;
+  }
+  .toast.show { opacity: 1; }
+  .toast.error { border-color: var(--critical); color: var(--critical); }
+
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<header>
+  <div class="head-inner">
+    <div>
+      <p class="eyebrow">AI Trading Platform</p>
+      <h1>Trading console</h1>
+    </div>
+    <div class="controls">
+      <span class="pill" id="mode-pill"><span class="dot"></span><span id="mode-label">…</span></span>
+      <span class="pill" id="conn-pill"><span class="dot"></span><span id="conn-label">connecting</span></span>
+      <input type="password" id="token" placeholder="API token" autocomplete="off">
+    </div>
+  </div>
+</header>
+
+<main>
+  <dl class="tiles" id="tiles"></dl>
+
+  <div class="panel">
+    <div class="panel-head">
+      <h2>Controls</h2>
+      <span class="eyebrow">Writes require the token</span>
+    </div>
+    <div class="panel-body controls">
+      <button type="button" data-mode="MANUAL">Manual</button>
+      <button type="button" data-mode="APPROVAL">Approval</button>
+      <button type="button" data-mode="AUTOMATIC">Automatic</button>
+      <span style="flex:1"></span>
+      <button type="button" class="danger" id="kill">Emergency stop</button>
+      <button type="button" id="release" hidden>Release stop</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-head"><h2>Equity</h2><span class="eyebrow" id="equity-meta"></span></div>
+    <div class="panel-body">
+      <svg class="spark" id="equity" viewBox="0 0 900 180" preserveAspectRatio="none"
+           role="img" aria-label="Account equity over time"></svg>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <div class="panel-head"><h2>Positions</h2></div>
+      <div class="panel-body scroll"><div id="positions"></div></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h2>Pending approvals</h2></div>
+      <div class="panel-body scroll"><div id="approvals"></div></div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <div class="panel-head"><h2>Recent orders</h2></div>
+      <div class="panel-body scroll tall"><div id="orders"></div></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h2>Closed trades</h2></div>
+      <div class="panel-body scroll tall"><div id="trades"></div></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-head">
+      <h2>Reconciliation breaks</h2>
+      <span class="eyebrow">Platform state vs the broker</span>
+    </div>
+    <div class="panel-body scroll"><div id="breaks"></div></div>
+  </div>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+
+  var money = function (n) {
+    var abs = Math.abs(n);
+    if (abs >= 1e7) return "₹" + (n / 1e7).toFixed(2) + "cr";
+    if (abs >= 1e5) return "₹" + (n / 1e5).toFixed(2) + "L";
+    return "₹" + n.toLocaleString("en-IN", { maximumFractionDigits: 0 });
+  };
+  var sign = function (n) { return n > 0 ? "pos" : n < 0 ? "neg" : ""; };
+  var esc = function (s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  };
+
+  function toast(message, isError) {
+    var el = $("toast");
+    el.textContent = message;
+    el.className = "toast show" + (isError ? " error" : "");
+    setTimeout(function () { el.className = "toast"; }, 3200);
+  }
+
+  // The token lives in sessionStorage, not localStorage: it should not
+  // outlive the browser session on a shared machine.
+  var token = sessionStorage.getItem("apiToken") || "";
+  $("token").value = token;
+  $("token").addEventListener("change", function (e) {
+    token = e.target.value.trim();
+    sessionStorage.setItem("apiToken", token);
+    toast(token ? "Token saved for this session" : "Token cleared");
+  });
+
+  function get(path) {
+    return fetch(path).then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    });
+  }
+
+  function post(path, body) {
+    if (!token) {
+      toast("Enter the API token first — writes are authenticated", true);
+      return Promise.reject(new Error("no token"));
+    }
+    return fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+      body: JSON.stringify(body || {}),
+    }).then(function (r) {
+      return r.json().then(function (data) {
+        if (!r.ok) throw new Error(data.error || "HTTP " + r.status);
+        return data;
+      });
+    });
+  }
+
+  // ---- rendering --------------------------------------------------------
+
+  function renderStatus(s) {
+    var dayPnl = s.realisedPnl + s.unrealisedPnl;
+    var tiles = [
+      { label: "Equity", value: money(s.equityRupees != null ? s.equityRupees : s.equity / 100) },
+      { label: "Cash", value: money(s.cashRupees != null ? s.cashRupees : s.cash / 100) },
+      { label: "Unrealised", value: money(s.unrealisedPnl / 100), cls: sign(s.unrealisedPnl) },
+      { label: "Realised", value: money(s.realisedPnl / 100), cls: sign(s.realisedPnl) },
+      { label: "Open positions", value: String(s.openPositions) },
+      { label: "Pending approvals", value: String(s.pendingApprovals) },
+      { label: "Loss streak", value: String(s.lossStreak.streak),
+        cls: s.lossStreak.trippedAt ? "neg" : "" },
+      { label: "Strategy", value: s.strategy },
+    ];
+
+    $("tiles").innerHTML = tiles.map(function (t) {
+      return '<div class="tile"><dt>' + esc(t.label) + "</dt><dd" +
+        (t.cls ? ' class="' + t.cls + '"' : "") + ">" + esc(t.value) + "</dd></div>";
+    }).join("");
+
+    var halted = s.killSwitch.engaged;
+    var pill = $("mode-pill");
+    pill.className = "pill " + (halted ? "halted" : s.mode === "AUTOMATIC" ? "live" : "staged");
+    $("mode-label").textContent = halted ? "HALTED — " + s.killSwitch.reason : s.mode;
+
+    Array.prototype.forEach.call(document.querySelectorAll("[data-mode]"), function (b) {
+      b.setAttribute("aria-pressed", String(b.getAttribute("data-mode") === s.mode));
+    });
+
+    $("kill").hidden = halted;
+    $("release").hidden = !halted;
+  }
+
+  function table(headers, rows, emptyMessage) {
+    if (!rows.length) return '<p class="empty">' + esc(emptyMessage) + "</p>";
+    return "<table><thead><tr>" +
+      headers.map(function (h) { return "<th>" + esc(h) + "</th>"; }).join("") +
+      "</tr></thead><tbody>" + rows.join("") + "</tbody></table>";
+  }
+
+  function renderPositions(list) {
+    $("positions").innerHTML = table(
+      ["Symbol", "Qty", "Avg", "Last", "Unrealised"],
+      list.map(function (p) {
+        return "<tr><td class=\"code\">" + esc(p.symbol) + "</td><td>" + p.quantity +
+          "</td><td>" + money(p.averagePriceRupees) + "</td><td>" + money(p.lastPriceRupees) +
+          '</td><td class="' + sign(p.unrealisedPnl) + '">' + money(p.unrealisedPnlRupees) +
+          "</td></tr>";
+      }),
+      "Flat — no open positions.",
+    );
+  }
+
+  function renderApprovals(list) {
+    $("approvals").innerHTML = table(
+      ["Symbol", "Side", "Qty", ""],
+      list.map(function (a) {
+        return "<tr><td class=\"code\">" + esc(a.symbol) + "</td><td>" + esc(a.side) +
+          "</td><td>" + a.quantity + '</td><td>' +
+          '<button type="button" data-approve="' + esc(a.idempotencyKey) + '">Approve</button> ' +
+          '<button type="button" data-reject="' + esc(a.idempotencyKey) + '">Reject</button>' +
+          "</td></tr>";
+      }),
+      "Nothing waiting. In Automatic mode orders are not staged.",
+    );
+  }
+
+  function renderOrders(list) {
+    $("orders").innerHTML = table(
+      ["Symbol", "Side", "Qty", "Filled", "Status"],
+      list.map(function (o) {
+        return "<tr><td class=\"code\">" + esc(o.request.symbol) + "</td><td>" +
+          esc(o.request.side) + "</td><td>" + o.request.quantity + "</td><td>" +
+          o.filledQuantity + '</td><td class="code">' + esc(o.status) + "</td></tr>";
+      }),
+      "No orders yet.",
+    );
+  }
+
+  function renderTrades(list) {
+    $("trades").innerHTML = table(
+      ["Symbol", "Dir", "Qty", "Net P&L"],
+      list.map(function (t) {
+        return "<tr><td class=\"code\">" + esc(t.symbol) + "</td><td>" + esc(t.direction) +
+          "</td><td>" + t.quantity + '</td><td class="' + sign(t.pnl) + '">' +
+          (t.pnl > 0 ? "▲ " : t.pnl < 0 ? "▼ " : "") + money(t.pnlRupees) + "</td></tr>";
+      }),
+      "No closed trades yet.",
+    );
+  }
+
+  function renderBreaks(list) {
+    $("breaks").innerHTML = table(
+      ["Order", "Detail", "Detected"],
+      list.map(function (b) {
+        return "<tr><td class=\"code\">" + esc(b.orderId || "—") + '</td><td style="text-align:left">' +
+          esc(b.detail) + "</td><td>" + new Date(b.detectedAt).toISOString().slice(0, 19).replace("T", " ") +
+          "</td></tr>";
+      }),
+      "None open — platform state agrees with the broker.",
+    );
+  }
+
+  function renderEquity(curve) {
+    var svg = $("equity");
+    if (!curve.length) { svg.innerHTML = ""; $("equity-meta").textContent = "no data yet"; return; }
+
+    var W = 900, H = 180, PAD = { l: 58, r: 12, t: 12, b: 20 };
+    var lo = Infinity, hi = -Infinity;
+    curve.forEach(function (p) { lo = Math.min(lo, p.equity); hi = Math.max(hi, p.equity); });
+    var pad = (hi - lo) * 0.08 || Math.max(1, hi * 0.01);
+    lo -= pad; hi += pad;
+
+    var n = curve.length;
+    var x = function (i) { return PAD.l + (n === 1 ? 0 : (i / (n - 1)) * (W - PAD.l - PAD.r)); };
+    var y = function (v) { return PAD.t + (1 - (v - lo) / (hi - lo)) * (H - PAD.t - PAD.b); };
+
+    var line = "";
+    curve.forEach(function (p, i) { line += (i ? "L" : "M") + x(i).toFixed(1) + " " + y(p.equity).toFixed(1) + " "; });
+    var area = line + "L" + x(n - 1).toFixed(1) + " " + y(lo) + " L" + PAD.l + " " + y(lo) + " Z";
+
+    var grid = "";
+    [lo, (lo + hi) / 2, hi].forEach(function (v) {
+      grid += '<line x1="' + PAD.l + '" y1="' + y(v) + '" x2="' + (W - PAD.r) + '" y2="' + y(v) +
+        '" stroke="var(--hairline)" stroke-width="1"/>' +
+        '<text x="' + (PAD.l - 7) + '" y="' + (y(v) + 3.5) + '" text-anchor="end" ' +
+        'font-size="10" fill="var(--muted)">' + money(v) + "</text>";
+    });
+
+    svg.innerHTML = grid +
+      '<path d="' + area + '" fill="var(--accent-soft)"/>' +
+      '<path d="' + line + '" fill="none" stroke="var(--accent)" stroke-width="2" ' +
+      'stroke-linejoin="round" vector-effect="non-scaling-stroke"/>' +
+      '<circle cx="' + x(n - 1) + '" cy="' + y(curve[n - 1].equity) + '" r="3.5" ' +
+      'fill="var(--accent)" stroke="var(--surface)" stroke-width="2"/>';
+
+    $("equity-meta").textContent = n + " points";
+  }
+
+  // ---- actions ----------------------------------------------------------
+
+  Array.prototype.forEach.call(document.querySelectorAll("[data-mode]"), function (button) {
+    button.addEventListener("click", function () {
+      post("/api/mode", { mode: button.getAttribute("data-mode"), actor: "dashboard" })
+        .then(function (r) { toast("Mode is now " + r.mode); refresh(); })
+        .catch(function (e) { toast(e.message, true); });
+    });
+  });
+
+  $("kill").addEventListener("click", function () {
+    var reason = window.prompt("Reason for the emergency stop?", "operator halt");
+    if (reason === null) return;
+    post("/api/risk/kill-switch", { engaged: true, reason: reason, actor: "dashboard" })
+      .then(function () { toast("Emergency stop engaged"); refresh(); })
+      .catch(function (e) { toast(e.message, true); });
+  });
+
+  $("release").addEventListener("click", function () {
+    post("/api/risk/kill-switch", { engaged: false, actor: "dashboard" })
+      .then(function () { toast("Stop released"); refresh(); })
+      .catch(function (e) { toast(e.message, true); });
+  });
+
+  $("approvals").addEventListener("click", function (event) {
+    var target = event.target;
+    var approve = target.getAttribute && target.getAttribute("data-approve");
+    var reject = target.getAttribute && target.getAttribute("data-reject");
+
+    if (approve) {
+      post("/api/approvals/" + encodeURIComponent(approve) + "/approve")
+        .then(function () { toast("Order submitted"); refresh(); })
+        .catch(function (e) { toast(e.message, true); });
+    } else if (reject) {
+      post("/api/approvals/" + encodeURIComponent(reject) + "/reject", { reason: "rejected from dashboard" })
+        .then(function () { toast("Order rejected"); refresh(); })
+        .catch(function (e) { toast(e.message, true); });
+    }
+  });
+
+  // ---- polling & live socket --------------------------------------------
+
+  function refresh() {
+    Promise.all([
+      get("/api/status"), get("/api/positions"), get("/api/approvals"),
+      get("/api/orders?limit=40"), get("/api/trades?limit=40"),
+      get("/api/equity"), get("/api/reconciliation"),
+    ]).then(function (r) {
+      renderStatus(r[0]);
+      renderPositions(r[1].positions);
+      renderApprovals(r[2].approvals);
+      renderOrders(r[3].orders);
+      renderTrades(r[4].trades);
+      renderEquity(r[5].curve);
+      renderBreaks(r[6].breaks);
+    }).catch(function (e) { toast("Refresh failed: " + e.message, true); });
+  }
+
+  function connect() {
+    var protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    var socket = new WebSocket(protocol + "//" + location.host + "/ws");
+
+    socket.addEventListener("open", function () {
+      $("conn-pill").className = "pill live";
+      $("conn-label").textContent = "live";
+    });
+    socket.addEventListener("message", function (event) {
+      try {
+        var message = JSON.parse(event.data);
+        if (message.type === "status") renderStatus(message.payload);
+      } catch (e) { /* a malformed frame must not break the stream */ }
+    });
+    socket.addEventListener("close", function () {
+      $("conn-pill").className = "pill halted";
+      $("conn-label").textContent = "reconnecting";
+      setTimeout(connect, 3000);
+    });
+    socket.addEventListener("error", function () { socket.close(); });
+  }
+
+  refresh();
+  setInterval(refresh, 10000);
+  connect();
+})();
+</script>

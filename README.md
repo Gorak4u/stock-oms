@@ -2,121 +2,145 @@
 
 A resilient, auditable, single-user automated NSE trading platform.
 
-> **Status: research and paper-trading core.** The deterministic spine —
-> market data, features, strategies, model gating, risk, execution and
-> backtesting — is implemented and tested. The service layer around it (HTTP
-> API, dashboards, Redis/BullMQ, real broker connectors, monitoring stack) is
-> not yet built. See [Roadmap](#roadmap) for exactly what is and is not here.
+> **Status: complete stack, unproven strategies.** Every layer in the
+> architecture is built, tested and runs — API, persistence, messaging,
+> monitoring, containers, the live trading loop, and the operator dashboard.
+> What is *not* done is the part no amount of code can supply: the acceptance
+> criteria at the bottom of this file are unmet, because none of them can be
+> met without real NSE market data and time.
 >
-> **Do not point this at a live broker account yet.** Nothing has traded real
-> money, and the acceptance criteria below are unmet by construction.
+> **Do not point this at a funded broker account.** It defaults to a paper
+> broker, and reaching a live one takes a deliberate configuration change. That
+> default is the last line of defence, not a limitation to work around.
 
 ---
 
-## Why the core came first
-
-The architecture describes nine layers. They are not equally risky. A dashboard
-that renders wrong is embarrassing; a position sizer that rounds the wrong way,
-a fill simulator that is too optimistic, or an order path that duplicates on
-retry costs money and is hard to detect after the fact.
-
-So the first milestone is the part where mistakes are expensive and testing is
-possible: the deterministic path from a bar of market data to an order, plus
-the backtester that lets you find out whether a strategy is worth trading at
-all. Every layer above it is I/O around this core.
-
-That ordering also matches the project's own acceptance criteria, which run
-backtest → walk-forward → paper → small live. You cannot start at step one
-without a backtester you trust.
-
 ## Design commitments
 
-These are enforced by tests, not just intended.
+These are enforced by tests, not merely intended. Where a commitment cost
+something, the cost is stated.
 
-**Money is integer paise.** No monetary value is ever a float. `0.1 + 0.2` is a
-rounding curiosity in a spreadsheet and a reconciliation break in an execution
-path. See `src/domain/money.ts`.
+**Money is integer paise.** No monetary value is ever a float, in the
+application or in the database. `0.1 + 0.2` is a curiosity in a spreadsheet
+and a reconciliation break in an execution path.
 
 **No lookahead.** Indicators return arrays aligned to their input with `null`
-through the warm-up, and strategies may only read up to the current index. The
-backtester decides on a bar's close and fills on the *next* bar's open. A test
-runs the same prefix inside two series with different futures and asserts the
-equity curves are identical — if a strategy could see ahead, they would differ.
+through the warm-up; strategies may only read up to the current index; the
+backtester decides on a bar's close and fills on the next bar's open. A test
+runs the same prefix inside two series with *different futures* and asserts
+identical equity curves — if a strategy could see ahead, they would diverge.
 
-**Determinism.** Same inputs, same outputs, everywhere. Strategies do no I/O and
-consult no clock. Model training is full-batch with a fixed iteration count and
-no randomness. A backtest run twice produces byte-identical results, and an
-audit log written today can be replayed tomorrow.
+**Determinism.** Same inputs, same outputs. Strategies do no I/O and consult no
+clock; model training is full-batch with a fixed iteration count and no
+randomness; a backtest run twice is byte-identical.
 
-**One intent, one order.** Idempotency keys are derived from the trade intent
-(strategy, symbol, side, quantity, decision bar), not randomly generated, so a
-retry after a crash re-derives the same key and is refused. An order is
-persisted as `PENDING_NEW` *before* the broker call, and a submission whose
-outcome is unknown is never blindly retried — it is reconciled against the
-broker.
+**One intent, one order.** Idempotency keys are derived from the trade intent,
+not generated, so a retry after a crash re-derives the same key. The key is
+`UNIQUE` in Postgres, so duplicate prevention survives a process restart rather
+than living only in memory.
+
+**Uncertain is not the same as failed.** A broker timeout or 5xx on a *submit*
+is classified `UNCERTAIN`, never retryable — the order may have reached the
+exchange. The OMS parks it and reconciles against the broker's own order book.
+The same failure on a read is merely retryable. Conflating the two is how
+automated systems end up with two positions where the operator intended one.
 
 **Risk-reducing orders are never blocked.** Every risk control can stop an order
-that opens exposure. None may stop one that closes it. A control that traps the
-account in a losing position while the market runs away is worse than no
-control.
+that opens exposure; none may stop one that closes it. A control that traps the
+account in a losing position is worse than no control.
+
+**Circuit breakers pause, they do not latch.** The consecutive-loss breaker
+releases after a cooling-off period. An earlier revision latched, and because
+only a *winning* trade clears a losing streak while no trade could be opened, it
+disabled the system permanently the first time it tripped — silently, while
+every dashboard showed it running.
 
 **Costs always apply.** Brokerage, STT, exchange charges, GST, SEBI fees, stamp
-duty and slippage are modelled and charged in every backtest. On NSE intraday a
-round trip costs roughly 0.05–0.12% of turnover; a strategy with a 0.08% gross
-edge is a losing strategy, and only a cost model reveals that.
+duty and slippage are charged in every backtest. On NSE intraday a round trip
+costs roughly 0.05–0.12% of turnover; a strategy with a 0.08% gross edge is a
+losing strategy, and only a cost model reveals that.
 
 **The model can only veto.** The AI layer filters signals the strategy layer
-already produced. It cannot originate a trade, choose a direction, or enlarge a
-position. Its worst case is bounded: it stops the system trading. It also fails
-*open* — no promoted model, a thrown exception, missing features or detected
-drift all pass the signal through untouched, leaving the strategy and risk
-layers to stand on their own.
+already produced — it cannot originate a trade, pick a direction, or enlarge a
+position. It also fails *open*: no promoted model, a thrown exception, missing
+features or detected drift all pass the signal through untouched.
+
+**The audit log is append-only in the database.** A trigger rejects `UPDATE` and
+`DELETE` on `audit_record`, so a mistake in application code cannot rewrite
+history. Records are hash-chained, and the chain **continues across restarts**
+rather than forking.
+
+**State survives restarts, including the emergency stop.** The portfolio is
+rebuilt by replaying stored fills, never by trusting a stored position row — so
+a stale or corrupted position cannot outlive a restart. Automation mode and an
+engaged kill switch are both restored: a crash must not silently resume trading
+a human had stopped.
 
 ## Layout
 
 ```
 src/
-  domain/        money (integer paise), core types
+  domain/        integer-paise money, core types
   marketdata/    NSE calendar, tick→OHLC, validation, corporate actions
   features/      technical indicators
-  ai/            feature extraction, logistic baseline, drift, registry, inference
+  ai/            feature extraction, logistic baseline, PSI drift, registry,
+                 inference gating, training pipeline
   strategy/      trend following, mean reversion, momentum, volatility breakout
-  risk/          position sizing, the risk engine, kill switch
-  execution/     costs, broker interface, paper broker, portfolio, OMS
-  backtest/      metrics, backtest engine, walk-forward validation
-  pipeline/      the live workflow spine
-  audit/         hash-chained append-only log
+  options/       Black-Scholes pricing, greeks, defined-risk structures
+  risk/          stop-distance sizing, the control set, kill switch
+  execution/     costs, broker interface, paper broker, Zerodha connector,
+                 portfolio, OMS
+  backtest/      engine, metrics, walk-forward validation
+  pipeline/      the workflow spine (manual / approval / automatic)
+  persistence/   schema, repository ports, Postgres and in-memory adapters
+  messaging/     Redis queue with retries, dead-letter and crash recovery
+  monitoring/    metrics, health, alerts, trade reconciliation
+  runtime/       trading service, live runner
+  api/           Fastify REST + WebSocket
+  main.ts        process entrypoint
+web/             operator dashboard, backtest console template
 ```
 
-## Getting started
+## Running it
+
+### Full stack
+
+```bash
+export API_TOKEN=$(openssl rand -hex 24)   # required; ≥16 chars
+docker compose up --build
+```
+
+Then open **http://localhost:8080** for the operator dashboard.
+
+### Locally
 
 ```bash
 npm install
-npm run typecheck      # tsc --noEmit
-npm test               # 294 tests
-npm run backtest       # runnable demo over a synthetic series
-npm run build:console  # dist/console.html — interactive, open in a browser
+npm run typecheck
+npm test                # 537 tests
+npm run build && npm start
+
+npm run backtest        # terminal demo over a synthetic series
+npm run build:console   # dist/console.html — interactive, open in a browser
 ```
 
-Requires Node 20+. The core has **zero runtime dependencies** — only dev
-tooling. That is deliberate: the deterministic path should not be able to break
-because a transitive dependency changed.
+Requires Node 20+, Postgres 16 and Redis. The tests skip the Postgres and Redis
+suites (loudly) when neither is reachable, so the deterministic core stays
+testable on a bare machine.
 
-## The backtest console
+### Configuration
 
-`npm run build:console` produces a single self-contained `dist/console.html`.
-Open it directly — no server, no network. It runs the **real engine** compiled
-to the browser: the same strategy, risk, sizing, cost and fill code the Node
-build uses, so a result there matches `npm run backtest` exactly.
-
-You can change strategy and parameters, adjust the risk limits, toggle costs and
-trailing stops, run against a seeded synthetic series or paste your own OHLC CSV,
-and walk-forward validate. It also surfaces the things a returns chart hides:
-which risk control refused each signal, and whether the audit chain verifies.
-
-`node:crypto` is aliased to a pure-JS SHA-256 for the browser bundle so the audit
-chain hashes identically in both environments — `__tests__/cryptoShim.test.ts`
-asserts the two agree byte for byte, including at the padding boundaries.
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `API_TOKEN` | — | **Required.** Bearer token for mutating routes; ≥16 chars |
+| `DATABASE_URL` | local Postgres | Connection string |
+| `REDIS_URL` | unset | Enables the Redis health check and queues |
+| `BROKER` | `paper` | `paper` or `zerodha` |
+| `KITE_API_KEY` / `KITE_ACCESS_TOKEN` | — | Required when `BROKER=zerodha` |
+| `OPENING_CASH` | `1000000` | Opening capital, in rupees |
+| `STRATEGY` | `trend` | `trend`, `meanReversion`, `momentum`, `volatility` |
+| `SYMBOLS` | empty | Comma-separated watchlist |
+| `RISK_PER_TRADE` / `MAX_POSITION` / `DAILY_LOSS_LIMIT` / `MAX_DRAWDOWN` | see below | Risk limits as fractions |
 
 ## The workflow
 
@@ -124,111 +148,133 @@ asserts the two agree byte for byte, including at the padding boundaries.
 market data → features → strategy → AI → risk → execution → broker
 ```
 
-`TradingPipeline` (`src/pipeline/tradingPipeline.ts`) sequences those layers and
-holds no trading logic itself. `BacktestEngine` drives the *same* components
-against history. Anything simulated in one and reimplemented in the other is a
-place the two can silently disagree, so the only simulated pieces are the clock
-and the exchange.
+`TradingPipeline` sequences those layers and holds no trading logic itself.
+`BacktestEngine` drives the *same* components against history — anything
+simulated in one and reimplemented in the other is a place the two can silently
+disagree, so the only simulated pieces are the clock and the exchange.
 
 ### Automation modes
 
 | Mode | Behaviour |
 | --- | --- |
-| `MANUAL` | Signals recorded, orders staged, nothing sent. |
-| `APPROVAL` | Orders staged and wait for explicit approval. Risk is **re-checked at approval time** — a verdict from minutes ago may have been overtaken by a drawdown or a tripped breaker. |
-| `AUTOMATIC` | Orders sent as soon as they clear risk. |
+| `MANUAL` | Signals recorded, orders staged, nothing sent |
+| `APPROVAL` | Orders staged; risk is **re-checked at approval time**, since a verdict from minutes ago may have been overtaken by a drawdown |
+| `AUTOMATIC` | Orders sent as soon as they clear risk |
 
-Mode changes are audited: "who turned automatic trading on, and when" is the
-first question asked after an incident.
+Mode changes are audited with the actor — "who turned automatic trading on, and
+when" is the first question asked after an incident.
 
 ## Risk controls
-
-Configured in `src/risk/types.ts`; defaults are deliberately tighter than most
-traders would pick, because a too-tight limit costs a missed trade and a
-too-loose one costs an account.
 
 | Control | Default | Behaviour |
 | --- | --- | --- |
 | Risk per trade | 1% of equity | Sizes the position from the stop distance |
-| Max position value | 10% of equity | Scales the order down |
-| Gross exposure | 100% of equity | Scales down |
-| Net exposure | 75% of equity | Scales down |
-| Symbol concentration | 15% of equity | Scales down |
+| Max position value | 10% of equity | Scales down |
+| Gross / net exposure | 100% / 75% | Scales down |
+| Symbol concentration | 15% | Scales down |
 | Daily loss limit | 3% of start-of-day equity | Halts |
 | Max drawdown | 15% from peak | Halts |
 | Max open positions | 10 | Halts |
-| Consecutive losses | 4 | Halts |
+| Consecutive losses | 4, then a cooling-off period | Pauses |
 | Order rate | 30/minute | Halts (runaway-loop guard) |
 | Stop-loss required | on | Rejects entries with no protective stop |
-| Emergency stop | manual | Blocks all risk-increasing orders until released |
+| Emergency stop | manual | Blocks all risk-increasing orders; survives restarts |
 
-State controls (halts) reject outright. Size controls scale the quantity down
-instead — trading less is a sensible response to "this order is too big", but
-not to "the system should not be trading at all".
+State controls reject; size controls scale the quantity down. Trading less is a
+sensible response to "this order is too big", but not to "the system should not
+be trading at all".
 
-## Backtesting
+## API
 
-```ts
-const engine = new BacktestEngine({
-  openingCash: fromRupees(1_000_000),
-  limits: DEFAULT_RISK_LIMITS,
-  useTrailingStops: true,
-});
+Reads are open; every mutating route needs `Authorization: Bearer $API_TOKEN`.
 
-const result = await engine.run(new TrendFollowingStrategy(), candles);
-console.log(result.metrics.sharpe, result.metrics.drawdown.maxDrawdown);
-```
+| Route | Purpose |
+| --- | --- |
+| `GET /` | Operator dashboard |
+| `GET /health` | Health report; 503 when unhealthy |
+| `GET /metrics` | Prometheus exposition |
+| `GET /api/status` | Mode, equity, kill switch, loss streak |
+| `GET /api/positions` · `/api/orders` · `/api/trades` · `/api/equity` | Portfolio |
+| `GET /api/risk` | Configured limits and current state |
+| `POST /api/mode` | Change automation mode |
+| `POST /api/risk/kill-switch` | Engage or release the emergency stop |
+| `GET /api/approvals` · `POST /api/approvals/:key/{approve,reject}` | Approval queue |
+| `GET /api/audit` | Audit records and chain verification |
+| `GET /api/reconciliation` | Open breaks against the broker |
+| `POST /api/backtest` | Backtest a stored symbol |
+| `WS /ws` | Live status stream (best-effort) |
 
-Results carry the equity curve, closed trades, every signal, every risk
-rejection with its reason, every model veto, and the audit log — so a
-surprising number can always be traced back to the decision that produced it.
+## Backtest console
 
-### Walk-forward validation
+`npm run build:console` produces a self-contained `dist/console.html` that runs
+the **real engine** compiled to the browser — same strategy, risk, sizing, cost
+and fill code as the Node build, so results match `npm run backtest` exactly. It
+takes synthetic data or your own OHLC CSV, and surfaces which risk control
+refused each signal.
 
-A single backtest over tuned parameters proves nothing; with enough parameters
-any series can be fitted. `walkForward` selects parameters on a training window
-and evaluates them, untouched, on the window that follows, rolling forward. Only
-the out-of-sample results are reported.
+`node:crypto` is aliased to a pure-JS SHA-256 for that bundle; the test suite
+asserts the two agree byte for byte, including at the padding boundaries.
 
-The `efficiency` figure is out-of-sample ÷ in-sample performance. Near 1 means
-the edge survived. Well below 1 means the parameters were fitted to noise and
-the strategy should not be traded.
+## Testing
+
+537 tests. The parts worth calling out:
+
+- **One contract suite, two implementations.** The in-memory and Postgres
+  repositories run the same 45 cases, so a divergence fails the build. It has
+  already caught one.
+- **Live infrastructure.** The persistence and API suites run against real
+  Postgres; the queue suite against real Redis. They skip loudly, never
+  silently, when unavailable.
+- **Numerical checks.** Options greeks are pinned against numerical derivatives
+  and put-call parity; the crypto shim against published SHA-256 vectors.
+
+Jest runs serially (`maxWorkers: 1`) because the database-backed suites share
+one database and truncate between cases.
 
 ## Roadmap
 
-Implemented:
+Built and tested:
 
 - [x] Market data — NSE calendar, tick→OHLC, validation, corporate actions
-- [x] Feature engineering — indicators, extraction, scaling
-- [x] AI — logistic baseline, model registry with gated promotion, PSI drift detection, inference gating
-- [x] Strategies — trend following, mean reversion, momentum, volatility breakout
-- [x] Risk — sizing, all controls above, kill switch
-- [x] Execution — cost model, broker interface with failover, paper broker, portfolio, OMS
-- [x] Backtesting — engine, metrics, walk-forward
-- [x] Audit — hash-chained append-only log
-- [x] Pipeline — the workflow spine with automation modes
+- [x] Feature engineering and the AI layer, including the training pipeline
+- [x] Four strategies, plus options pricing and five defined-risk structures
+- [x] Risk engine, position sizing, kill switch
+- [x] Execution — costs, paper broker, Zerodha connector, portfolio, OMS
+- [x] Backtesting — engine, metrics, walk-forward validation
+- [x] Persistence — Postgres schema, repositories, migrations
+- [x] Messaging — Redis queue with retries, dead-letter, crash recovery
+- [x] Monitoring — metrics, health checks, alerting, trade reconciliation
+- [x] API — REST, WebSocket, token auth
+- [x] Operator dashboard
+- [x] Live trading runner with session awareness and square-off
+- [x] Containers — Dockerfile and docker-compose
 
-Not yet built:
+Deliberately not built:
 
-- [ ] API layer — Fastify, REST/GraphQL/WebSocket, auth
-- [ ] Front end — trading, portfolio, options, backtesting, admin dashboards
-- [ ] Messaging — Redis, BullMQ, event and retry queues
-- [ ] Persistence — Postgres schema and migrations, object storage
-- [ ] Real broker connectors (the interface and a failover wrapper exist; no live implementation)
-- [ ] Options strategies and an options pricing layer
-- [ ] Training pipeline and feature store as services
-- [ ] Monitoring — metrics, error tracking, health checks, alerting, reconciliation jobs
-- [ ] Containers and deployment
+- [ ] Multi-user accounts and roles — the platform is single-user by design
+- [ ] GraphQL — REST plus a WebSocket covers every current consumer
+- [ ] A separate feature-store service — the extractor is in-process and fast enough
+- [ ] Naked short options — unbounded loss cannot be sized against
 
 ## Acceptance criteria
 
-None of these are met yet, and the gap is the point of listing them:
+**None of these are met, and that is the honest position:**
 
-- [ ] Five years of backtesting on real NSE data (the engine exists; the data does not)
+- [ ] Five years of backtesting on real NSE data
 - [ ] Walk-forward validation on that data
 - [ ] Paper trading
 - [ ] Live testing with small capital
 - [ ] Continuous monitoring
+
+The engine, the metrics and the walk-forward machinery are ready and tested.
+What is missing is real market history. Synthetic data can only demonstrate
+that the machinery runs — on a random walk the strategies return roughly zero
+and walk-forward efficiency correctly reports the in-sample results as fitted
+noise. That is the system working, not a result.
+
+**The next step is data, not code.** Load real NSE history into the `candle`
+table, run the five-year backtest and walk-forward validation, and let those
+results decide whether any of these strategies deserves paper trading.
 
 ## Purpose
 

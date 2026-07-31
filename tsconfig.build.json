@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": false,
+    "sourceMap": false,
+    // Pinned so the emitted tree is dist/main.js rather than dist/src/main.js.
+    // Without an explicit rootDir, tsc infers it from the widest common
+    // directory of the inputs, which shifts the whole layout the moment a file
+    // outside src is included.
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "__tests__", "scripts"]
+}

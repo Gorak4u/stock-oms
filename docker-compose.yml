@@ -1,0 +1,72 @@
+# Full local stack: Postgres, Redis and the platform.
+#
+# Defaults are for local development. Two things must be set explicitly before
+# this goes anywhere real:
+#
+#   * API_TOKEN — the app refuses to start without one, and rejects anything
+#     shorter than 16 characters.
+#   * BROKER — defaults to `paper`. Reaching a live broker requires setting it
+#     to `zerodha` and supplying credentials, so it can never happen by
+#     accident or by inheriting a stale environment.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: trader
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trader}
+      POSTGRES_DB: trading
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - '5432:5432'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U trader -d trading']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    # Persist to disk: the queue holds order submissions, which must survive a
+    # restart. An in-memory-only Redis would silently drop them.
+    command: ['redis-server', '--appendonly', 'yes']
+    volumes:
+      - redis-data:/data
+    ports:
+      - '6379:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://trader:${POSTGRES_PASSWORD:-trader}@postgres:5432/trading
+      REDIS_URL: redis://redis:6379
+      API_TOKEN: ${API_TOKEN:?set API_TOKEN to a value of at least 16 characters}
+      BROKER: ${BROKER:-paper}
+      KITE_API_KEY: ${KITE_API_KEY:-}
+      KITE_ACCESS_TOKEN: ${KITE_ACCESS_TOKEN:-}
+      OPENING_CASH: ${OPENING_CASH:-1000000}
+      STRATEGY: ${STRATEGY:-trend}
+      SYMBOLS: ${SYMBOLS:-}
+      RISK_PER_TRADE: ${RISK_PER_TRADE:-0.01}
+      MAX_POSITION: ${MAX_POSITION:-0.1}
+      DAILY_LOSS_LIMIT: ${DAILY_LOSS_LIMIT:-0.03}
+      MAX_DRAWDOWN: ${MAX_DRAWDOWN:-0.15}
+      PORT: 8080
+    ports:
+      - '8080:8080'
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:

@@ -89,6 +89,24 @@ function hashRecord(record: Omit<AuditRecord, 'hash'>): string {
  */
 export class InMemoryAuditLog implements AuditSink {
   private readonly records: AuditRecord[] = [];
+  private resumeSequence = 0;
+  private resumeHash = GENESIS_HASH;
+
+  /**
+   * Continues an existing chain after a restart.
+   *
+   * Without this the log restarts at sequence 1 with a genesis predecessor,
+   * which both collides with the sequences already stored and silently forks
+   * the hash chain — the durable log would no longer verify end to end. Called
+   * on startup with the persisted head.
+   */
+  resumeFrom(sequence: number, hash: string): void {
+    if (this.records.length > 0) {
+      throw new Error('cannot resume a chain that has already been appended to');
+    }
+    this.resumeSequence = sequence;
+    this.resumeHash = hash;
+  }
 
   append(
     type: AuditEventType,
@@ -96,9 +114,9 @@ export class InMemoryAuditLog implements AuditSink {
     payload: Record<string, unknown>,
     timestamp: Timestamp,
   ): AuditRecord {
-    const previousHash = this.records[this.records.length - 1]?.hash ?? GENESIS_HASH;
+    const previousHash = this.records[this.records.length - 1]?.hash ?? this.resumeHash;
     const partial = {
-      sequence: this.records.length + 1,
+      sequence: this.resumeSequence + this.records.length + 1,
       timestamp,
       type,
       correlationId,
@@ -131,7 +149,9 @@ export class InMemoryAuditLog implements AuditSink {
    * the log is intact.
    */
   verifyChain(): number | null {
-    let previousHash = GENESIS_HASH;
+    // Starts from the resumed head, not genesis, so a chain continued across
+    // a restart still verifies over the records this process appended.
+    let previousHash = this.resumeHash;
 
     for (const record of this.records) {
       if (record.previousHash !== previousHash) return record.sequence;

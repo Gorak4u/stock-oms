@@ -11,7 +11,9 @@
     "test": "jest",
     "test:watch": "jest --watch",
     "backtest": "ts-node scripts/run-backtest.ts",
-    "build:console": "node scripts/build-console.js"
+    "build": "tsc -p tsconfig.build.json && node scripts/copy-assets.js",
+    "build:console": "node scripts/build-console.js",
+    "start": "node dist/main.js"
   },
   "devDependencies": {
     "@types/jest": "^29.5.12",
