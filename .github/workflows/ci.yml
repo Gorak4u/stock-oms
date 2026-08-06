@@ -1,0 +1,230 @@
+name: CI
+
+# The whole point of this workflow is that the adapter suites actually run.
+# Locally they skip when Postgres or Redis is absent, which is the right
+# default for a unit-test loop but the wrong one for a merge gate: the Postgres
+# repositories and the Redis queue are the layers closest to production, and a
+# green build that silently ran neither is worse than no build at all.
+#
+# REQUIRE_INFRA=1 turns those skips into failures, so a broken service
+# container fails the job instead of quietly halving the test suite.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  test:
+    name: Typecheck and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: trader
+          POSTGRES_PASSWORD: trader
+          POSTGRES_DB: trading
+        ports: ['5432:5432']
+        # Without a healthcheck the job races the container and fails on a
+        # connection refused that looks like a code problem.
+        options: >-
+          --health-cmd "pg_isready -U trader -d trading"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgres://trader:trader@127.0.0.1:5432/trading
+      TEST_DATABASE_URL: postgres://trader:trader@127.0.0.1:5432/trading
+      REDIS_URL: redis://127.0.0.1:6379
+      REQUIRE_INFRA: '1'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      # The suites shell out to pg_isready and redis-cli to decide whether the
+      # dependency is up; with REQUIRE_INFRA set, a missing client binary would
+      # fail the run rather than silently skip.
+      - name: Install database clients
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client redis-tools
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test -- --coverage --ci
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+          retention-days: 7
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Build the browser console
+        run: npm run build:console
+
+      # Guards the failure mode the asset copier exists to prevent: a container
+      # that builds cleanly and then dies on its first migrate() call because
+      # tsc does not copy .sql files into dist.
+      - name: Verify migrations reached the build output
+        run: |
+          test -d dist/persistence/migrations
+          test -n "$(ls -A dist/persistence/migrations/*.sql)"
+          echo "migrations present in dist:"
+          ls dist/persistence/migrations
+
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ai-trading-platform:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The image runs as an unprivileged user and holds broker credentials;
+      # confirm it did not silently revert to root.
+      - name: Verify the image runs unprivileged
+        run: |
+          user=$(docker run --rm --entrypoint sh ai-trading-platform:ci -c 'id -un')
+          echo "image runs as: $user"
+          test "$user" = "node"
+
+  smoke:
+    name: End-to-end smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [build]
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: trader
+          POSTGRES_PASSWORD: trader
+          POSTGRES_DB: trading
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U trader -d trading"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      # Starting the real process is the only check that covers wiring: unit
+      # tests exercise every layer, and none of them would notice main.ts
+      # failing to migrate, bind, or answer a health check.
+      - name: Boot the process and probe it
+        env:
+          DATABASE_URL: postgres://trader:trader@127.0.0.1:5432/trading
+          API_TOKEN: ci-token-that-is-long-enough
+          BROKER: paper
+          PORT: '8099'
+        run: |
+          node dist/main.js > app.log 2>&1 &
+          pid=$!
+
+          for i in $(seq 1 30); do
+            if curl -sf localhost:8099/health > /dev/null; then break; fi
+            sleep 1
+          done
+
+          echo "--- health ---"
+          curl -sf localhost:8099/health | tee health.json
+          grep -q '"status":"healthy"' health.json
+
+          echo "--- reads require a token ---"
+          code=$(curl -s -o /dev/null -w '%{http_code}' localhost:8099/api/status)
+          test "$code" = "401"
+
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H 'Authorization: Bearer ci-token-that-is-long-enough' localhost:8099/api/status)
+          test "$code" = "200"
+
+          echo "--- graceful shutdown drains ---"
+          kill -TERM $pid
+          wait $pid
+          grep -q 'shutdown complete' app.log
+
+          echo "--- log ---"
+          cat app.log
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-logs
+          path: app.log

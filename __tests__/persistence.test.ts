@@ -18,6 +18,7 @@ import type { ClosedTrade } from '../src/execution/portfolio';
 import { DuplicateKeyError, type Repositories } from '../src/persistence/ports';
 import { memoryRepositories } from '../src/persistence/memory';
 import { Database } from '../src/persistence/postgres';
+import { announceUnavailable } from './support/infra';
 
 const DATABASE_URL =
   process.env.TEST_DATABASE_URL ?? 'postgres://trader:trader@127.0.0.1:5432/trading';
@@ -546,11 +547,10 @@ const POSTGRES_AVAILABLE = postgresReachable();
 
 if (!POSTGRES_AVAILABLE) {
   // Visible rather than silent: a skipped adapter suite should never look like
-  // a passing one.
-  console.warn(
-    `Postgres not reachable at ${DATABASE_URL} — the adapter suite is SKIPPED. ` +
-      'Start a database or set TEST_DATABASE_URL to run it.',
-  );
+  // a passing one. Under REQUIRE_INFRA (which CI sets) it is a hard failure,
+  // because the adapter suite is the only thing standing between a broken
+  // query and production.
+  announceUnavailable('Postgres', DATABASE_URL, 'the persistence adapter suite');
 }
 
 let database: Database | null = null;

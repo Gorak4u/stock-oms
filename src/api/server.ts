@@ -3,8 +3,12 @@
  *
  * Fastify over the trading service. Three rules shape the route design:
  *
- * - **Reads are free, writes are authenticated.** Every mutating route
- *   requires a bearer token, because these routes move money.
+ * - **Everything is authenticated by default.** Reads were once open, on the
+ *   reasoning that they change nothing. But what they *disclose* is the entire
+ *   position book, the equity curve and the audit log — enough to trade against
+ *   the account holder, and enough to be worth stealing on its own. Reads can
+ *   be opened deliberately (`publicReads`) for a dashboard behind a trusted
+ *   proxy; they are no longer open by accident.
  * - **Dangerous actions name their actor.** Engaging the kill switch or
  *   switching to automatic trading records who did it, so the audit log can
  *   answer "who turned this on" months later.
@@ -15,6 +19,8 @@
 
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import websocket from '@fastify/websocket';
+import rateLimit from '@fastify/rate-limit';
+import cors from '@fastify/cors';
 import { timingSafeEqual } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -32,9 +38,27 @@ export interface ApiConfig {
   readonly repositories: Repositories;
   readonly metrics: MetricsRegistry;
   readonly health: HealthMonitor;
-  /** Bearer token for mutating routes. Required — there is no unauthenticated mode. */
+  /** Bearer token for every route. Required — there is no unauthenticated mode. */
   readonly authToken: string;
   readonly logger?: boolean;
+  /**
+   * Serve read routes without a token.
+   *
+   * Off by default. Only turn it on where something else is doing the
+   * authenticating — a reverse proxy, an SSO gateway — because it publishes
+   * positions, trades and the audit log to anyone who can reach the port.
+   */
+  readonly publicReads?: boolean;
+  /** Origins allowed to call the API from a browser. Empty disables CORS entirely. */
+  readonly corsOrigins?: readonly string[];
+  /** Requests per minute per client. Protects the database behind the read routes. */
+  readonly rateLimitPerMinute?: number;
+  /** Largest accepted request body. Backtest payloads are the biggest legitimate one. */
+  readonly bodyLimitBytes?: number;
+  /** Called when an operator supplies a fresh broker session token. */
+  readonly onBrokerSession?: (input: {
+    requestToken?: string; accessToken?: string; actor: string;
+  }) => Promise<{ expiresAt: number | null }>;
 }
 
 /** Constant-time comparison; a plain `===` on a secret leaks its length by timing. */
@@ -46,7 +70,16 @@ function tokensMatch(provided: string, expected: string): boolean {
 }
 
 export function buildServer(config: ApiConfig): FastifyInstance {
-  const app = Fastify({ logger: config.logger ?? false });
+  const app = Fastify({
+    logger: config.logger ?? false,
+    // 1 MiB. A backtest request is a few hundred bytes; anything approaching
+    // this is a mistake or an attempt to exhaust memory.
+    bodyLimit: config.bodyLimitBytes ?? 1_048_576,
+    // Trust the proxy's forwarded address so rate limiting keys on the real
+    // client rather than on the single proxy IP every request appears to
+    // come from.
+    trustProxy: true,
+  });
   const { service, repositories, metrics, health } = config;
 
   if (!config.authToken || config.authToken.length < 16) {
@@ -55,17 +88,82 @@ export function buildServer(config: ApiConfig): FastifyInstance {
 
   void app.register(websocket);
 
+  void app.register(rateLimit, {
+    max: config.rateLimitPerMinute ?? 300,
+    timeWindow: '1 minute',
+    // Health and metrics are polled continuously by infrastructure that must
+    // never be throttled — a rate-limited health check reads as an outage.
+    allowList: (request) => request.url === '/health' || request.url === '/metrics',
+  });
+
+  // Default-deny: with no configured origins, no browser origin is allowed and
+  // the plugin is not registered at all.
+  const origins = config.corsOrigins ?? [];
+  if (origins.length > 0) {
+    void app.register(cors, {
+      origin: [...origins],
+      methods: ['GET', 'POST'],
+      credentials: true,
+    });
+  }
+
+  /**
+   * Extracts a bearer token from the header, or from a query parameter.
+   *
+   * The query fallback exists only for the websocket: browsers cannot set
+   * headers on a `WebSocket` handshake, so a token in the URL is the only way
+   * to authenticate one. It is accepted nowhere else, because URLs end up in
+   * access logs.
+   */
+  function bearerOf(request: FastifyRequest, allowQuery = false): string {
+    const header = request.headers.authorization ?? '';
+    if (header.startsWith('Bearer ')) return header.slice(7);
+
+    if (allowQuery) {
+      const { token } = request.query as { token?: string };
+      if (typeof token === 'string') return token;
+    }
+    return '';
+  }
+
+  function authorised(request: FastifyRequest, allowQuery = false): boolean {
+    const token = bearerOf(request, allowQuery);
+    return token !== '' && tokensMatch(token, config.authToken);
+  }
+
   /** Guards mutating routes. */
   function requireAuth(request: FastifyRequest, reply: FastifyReply): boolean {
-    const header = request.headers.authorization ?? '';
-    const token = header.startsWith('Bearer ') ? header.slice(7) : '';
-
-    if (!token || !tokensMatch(token, config.authToken)) {
+    if (!authorised(request)) {
       void reply.code(401).send({ error: 'unauthorised' });
       return false;
     }
     return true;
   }
+
+  /**
+   * Guards read routes unless reads have been opened deliberately.
+   *
+   * Applied as a hook rather than per route so a route added later is protected
+   * by default — the failure mode of the old per-route approach was that
+   * forgetting a guard silently published data.
+   */
+  app.addHook('onRequest', async (request, reply) => {
+    const path = request.url.split('?')[0] ?? '';
+
+    // Unauthenticated by necessity: the container healthcheck and the metrics
+    // scraper have no token, and neither discloses account data.
+    if (path === '/health' || path === '/metrics') return;
+
+    // Mutating routes and the websocket authenticate themselves, the latter
+    // because it also accepts a query token.
+    if (request.method !== 'GET' || path === '/ws') return;
+
+    if (config.publicReads) return;
+
+    if (!authorised(request)) {
+      await reply.code(401).send({ error: 'unauthorised' });
+    }
+  });
 
   function actorOf(request: FastifyRequest): string {
     const body = request.body as { actor?: unknown } | undefined;
@@ -241,6 +339,47 @@ export function buildServer(config: ApiConfig): FastifyInstance {
     breaks: await repositories.reconciliation.open(),
   }));
 
+  // ---- broker session ----------------------------------------------------
+
+  /**
+   * Supplies a fresh Kite session after the daily token expiry.
+   *
+   * Kite has no refresh token: a human must visit the login URL and hand back
+   * the `request_token` from the redirect. This route is how that gets in
+   * without a redeploy or a restart — the alternative was baking the token
+   * into the environment, which meant a container restart every morning.
+   */
+  app.post('/api/broker/session', async (request, reply) => {
+    if (!requireAuth(request, reply)) return;
+
+    if (!config.onBrokerSession) {
+      return reply.code(404).send({ error: 'the configured broker has no session to refresh' });
+    }
+
+    const body = request.body as { requestToken?: unknown; accessToken?: unknown };
+    const requestToken = typeof body?.requestToken === 'string' ? body.requestToken.trim() : '';
+    const accessToken = typeof body?.accessToken === 'string' ? body.accessToken.trim() : '';
+
+    if (!requestToken && !accessToken) {
+      return reply.code(400).send({ error: 'requestToken or accessToken is required' });
+    }
+
+    try {
+      const result = await config.onBrokerSession({
+        ...(requestToken ? { requestToken } : {}),
+        ...(accessToken ? { accessToken } : {}),
+        actor: actorOf(request),
+      });
+      return { ok: true, expiresAt: result.expiresAt };
+    } catch (error) {
+      // 502: the failure is the broker rejecting the exchange, not a bad
+      // request — the operator should retry the login, not fix their payload.
+      return reply.code(502).send({
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
   // ---- backtest ----------------------------------------------------------
 
   app.post('/api/backtest', async (request, reply) => {
@@ -302,7 +441,22 @@ export function buildServer(config: ApiConfig): FastifyInstance {
    * next one. Nothing that must not be lost travels over this socket.
    */
   app.register(async (instance) => {
-    instance.get('/ws', { websocket: true }, (socket) => {
+    instance.get('/ws', {
+      websocket: true,
+      /**
+       * Authenticated at the handshake, so an unauthorised client never gets a
+       * socket at all — the upgrade is refused with a plain 401 instead of
+       * being completed and then closed.
+       *
+       * This stream carries live equity and position data, and leaving it open
+       * was the widest of the read holes: it needed no polling to watch an
+       * account in real time.
+       */
+      onRequest: (request: FastifyRequest, reply: FastifyReply, done: () => void) => {
+        if (config.publicReads || authorised(request, true)) return done();
+        void reply.code(401).send({ error: 'unauthorised' });
+      },
+    }, (socket) => {
       const send = (): void => {
         try {
           socket.send(JSON.stringify({ type: 'status', payload: service.status(), at: Date.now() }));

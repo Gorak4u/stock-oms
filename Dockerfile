@@ -36,9 +36,10 @@ RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/web ./web
 
-# The schema is read at runtime by Database.migrate(), and tsc does not copy
-# non-TypeScript files into the output.
-COPY src/persistence/schema.sql ./dist/persistence/schema.sql
+# Migrations are read at runtime by Database.migrate(), and tsc does not copy
+# non-TypeScript files into the output. Copied as a directory so a newly added
+# migration cannot be left behind by a stale file list.
+COPY src/persistence/migrations ./dist/persistence/migrations
 
 # Run unprivileged. The node image ships a `node` user for exactly this.
 USER node

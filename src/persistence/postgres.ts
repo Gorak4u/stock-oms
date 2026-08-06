@@ -9,8 +9,7 @@
  */
 
 import { Pool, type PoolClient, type PoolConfig } from 'pg';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { Migrator, type MigrateResult } from './migrator';
 import type {
   Candle,
   Fill,
@@ -69,17 +68,116 @@ function toNumber(value: string | number | null): number {
   return n;
 }
 
+/**
+ * Pool tuning that the defaults get wrong for this workload.
+ *
+ * `pg` defaults to an unbounded statement timeout, which is how one stuck query
+ * becomes a stuck trading loop: the tick holds a connection, the next tick is
+ * blocked behind the re-entrancy guard, and the process looks alive while
+ * deciding nothing. Every timeout here exists to turn a hang into an error the
+ * loop can report and retry.
+ */
+export interface DatabaseOptions {
+  /** Maximum pooled connections. The trading loop is serial; this is for the API. */
+  readonly max?: number;
+  /** Kills a query that overruns, rather than letting it hold a tick open forever. */
+  readonly statementTimeoutMs?: number;
+  readonly connectionTimeoutMs?: number;
+  readonly idleTimeoutMs?: number;
+  /**
+   * TLS for the connection. Managed Postgres is usually remote, and an
+   * unencrypted link would carry positions and order flow in clear text.
+   */
+  readonly ssl?: PoolConfig['ssl'];
+}
+
+const DEFAULT_OPTIONS: Required<Omit<DatabaseOptions, 'ssl'>> = {
+  max: 10,
+  statementTimeoutMs: 15_000,
+  connectionTimeoutMs: 5_000,
+  idleTimeoutMs: 30_000,
+};
+
+/**
+ * Reads pool settings from the environment.
+ *
+ * `PGSSLMODE=require` maps to a TLS connection that does not verify the
+ * server certificate — which is what most managed providers hand you, and is
+ * stated plainly here rather than hidden, because it stops eavesdropping but
+ * not an active attacker. `verify-full` uses the system CA store.
+ */
+export function databaseOptionsFromEnv(env: NodeJS.ProcessEnv = process.env): DatabaseOptions {
+  const number = (name: string, fallback: number): number => {
+    const raw = env[name];
+    if (!raw) return fallback;
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value <= 0) {
+      throw new Error(`${name} must be a positive number, got ${raw}`);
+    }
+    return value;
+  };
+
+  const sslMode = env.PGSSLMODE;
+  const ssl: PoolConfig['ssl'] =
+    sslMode === 'require' || sslMode === 'prefer'
+      ? { rejectUnauthorized: false }
+      : sslMode === 'verify-full' || sslMode === 'verify-ca'
+        ? { rejectUnauthorized: true }
+        : undefined;
+
+  return {
+    max: number('PGPOOL_MAX', DEFAULT_OPTIONS.max),
+    statementTimeoutMs: number('PG_STATEMENT_TIMEOUT_MS', DEFAULT_OPTIONS.statementTimeoutMs),
+    connectionTimeoutMs: number('PG_CONNECT_TIMEOUT_MS', DEFAULT_OPTIONS.connectionTimeoutMs),
+    idleTimeoutMs: number('PG_IDLE_TIMEOUT_MS', DEFAULT_OPTIONS.idleTimeoutMs),
+    ...(ssl ? { ssl } : {}),
+  };
+}
+
 export class Database {
   readonly pool: Pool;
+  private readonly migrator: Migrator;
 
-  constructor(config: PoolConfig | string) {
-    this.pool = typeof config === 'string' ? new Pool({ connectionString: config }) : new Pool(config);
+  constructor(config: PoolConfig | string, options: DatabaseOptions = {}) {
+    const resolved = { ...DEFAULT_OPTIONS, ...options };
+
+    const base: PoolConfig = typeof config === 'string' ? { connectionString: config } : config;
+
+    this.pool = new Pool({
+      ...base,
+      max: resolved.max,
+      connectionTimeoutMillis: resolved.connectionTimeoutMs,
+      idleTimeoutMillis: resolved.idleTimeoutMs,
+      statement_timeout: resolved.statementTimeoutMs,
+      // A query cancelled by `statement_timeout` still holds its transaction
+      // open; this bounds that too, so a wedged transaction cannot pin a
+      // connection or block the next migration's advisory lock.
+      idle_in_transaction_session_timeout: resolved.statementTimeoutMs * 2,
+      ...(options.ssl !== undefined ? { ssl: options.ssl } : {}),
+    });
+
+    // An idle client erroring (a server restart, a dropped TLS session) emits
+    // 'error' on the pool. Unhandled, that is an uncaught exception that takes
+    // the process down; `pg` will discard and replace the client on its own.
+    this.pool.on('error', (error) => {
+      console.error(JSON.stringify({
+        level: 'error', msg: 'idle postgres client error', detail: error.message,
+      }));
+    });
+
+    this.migrator = new Migrator(this.pool);
   }
 
-  /** Applies the schema. Idempotent — every statement is IF NOT EXISTS or OR REPLACE. */
-  async migrate(): Promise<void> {
-    const sql = readFileSync(join(__dirname, 'schema.sql'), 'utf8');
-    await this.pool.query(sql);
+  /**
+   * Applies any migrations this database has not seen.
+   *
+   * Adopting an existing database created by the previous
+   * apply-the-whole-schema approach is safe: `001_initial` is written entirely
+   * in `IF NOT EXISTS` / `OR REPLACE` form, so re-applying it against a
+   * populated database changes nothing and simply records the baseline.
+   */
+  async migrate(): Promise<MigrateResult> {
+    return this.migrator.migrate();
   }
 
   /** Runs `fn` inside a transaction, rolling back on any throw. */

@@ -38,13 +38,27 @@ import {
 
 export interface ZerodhaConfig {
   readonly apiKey: string;
-  /** Obtained from the daily login flow; Kite access tokens expire each morning. */
-  readonly accessToken: string;
+  /**
+   * The access token, or a function returning the current one.
+   *
+   * A function is what production passes (see `KiteSession`): Kite tokens
+   * expire daily, and capturing a string here would pin the connector to a
+   * token that goes stale every morning with no way to replace it short of a
+   * restart.
+   */
+  readonly accessToken: string | (() => string);
   readonly baseUrl?: string;
   readonly timeoutMs?: number;
   /** Kite allows ~10 order requests/second; stay under it. */
   readonly maxRequestsPerSecond?: number;
   readonly fetchImpl?: typeof fetch;
+  /**
+   * Invoked when Kite rejects the token, before the error propagates.
+   *
+   * Lets the session mark itself dead and alert once, rather than every caller
+   * separately discovering the same expiry.
+   */
+  readonly onTokenRejected?: (message: string) => void;
 }
 
 interface KiteEnvelope<T> {
@@ -105,14 +119,16 @@ const STATUS_MAP: Readonly<Record<string, OrderStatus>> = {
   REJECTED: 'REJECTED',
 };
 
-/** Kite error types that no amount of retrying will fix. */
-const FATAL_ERROR_TYPES = new Set([
-  'InputException',
-  'MarginException',
-  'OrderException',
-  'PermissionException',
-  'TokenException',
-]);
+/**
+ * Kite error types that no amount of retrying will fix: `InputException`,
+ * `MarginException`, `OrderException`, `PermissionException`, `TokenException`.
+ *
+ * They need no lookup table — anything that is not a 429 or a 5xx is treated as
+ * non-retryable, so the safe classification is the default rather than
+ * something a missing entry could silently opt out of. `TokenException` is the
+ * one that gets extra handling below, because it invalidates the session rather
+ * than just the request.
+ */
 
 export function mapKiteStatus(kiteStatus: string, filled: number, total: number): OrderStatus {
   const mapped = STATUS_MAP[kiteStatus.toUpperCase()];
@@ -168,10 +184,16 @@ export class ZerodhaBroker implements BrokerConnector {
     if (!this.fetchImpl) throw new Error('no fetch implementation available');
   }
 
+  /** Resolved per request, so a token refreshed mid-session is picked up at once. */
+  private accessToken(): string {
+    const { accessToken } = this.config;
+    return typeof accessToken === 'function' ? accessToken() : accessToken;
+  }
+
   private headers(): Record<string, string> {
     return {
       'X-Kite-Version': '3',
-      Authorization: `token ${this.config.apiKey}:${this.config.accessToken}`,
+      Authorization: `token ${this.config.apiKey}:${this.accessToken()}`,
       'Content-Type': 'application/x-www-form-urlencoded',
     };
   }
@@ -249,9 +271,13 @@ export class ZerodhaBroker implements BrokerConnector {
         }
         throw new BrokerError(`broker error ${response.status}: ${message}`, true, errorType);
       }
-      if (FATAL_ERROR_TYPES.has(errorType)) {
-        throw new BrokerError(message, false, errorType);
+      // A rejected token is fatal for this call and for every subsequent one
+      // until an operator logs in again, so it is surfaced once, here, rather
+      // than rediscovered independently by each caller.
+      if (errorType === 'TokenException') {
+        this.config.onTokenRejected?.(message);
       }
+
       throw new BrokerError(message, false, errorType);
     }
 

@@ -5,6 +5,7 @@ import type { OrderRequest } from '../src/domain/types';
 import { BrokerError, BrokerUncertainError } from '../src/execution/broker';
 import { mapKiteStatus, ZerodhaBroker } from '../src/execution/zerodhaBroker';
 import { RedisQueue } from '../src/messaging/queue';
+import { announceUnavailable } from './support/infra';
 import {
   AlertManager,
   HealthMonitor,
@@ -252,7 +253,7 @@ function redisReachable(): boolean {
 
 const REDIS_AVAILABLE = redisReachable();
 if (!REDIS_AVAILABLE) {
-  console.warn('Redis not reachable at 127.0.0.1:6379 — the queue suite is SKIPPED.');
+  announceUnavailable('Redis', 'redis://127.0.0.1:6379', 'the queue suite');
 }
 
 (REDIS_AVAILABLE ? describe : describe.skip)('RedisQueue', () => {

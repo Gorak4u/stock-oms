@@ -36,6 +36,15 @@ export interface RunnerConfig {
   /** Bars of history handed to the strategy each tick. */
   readonly historyBars?: number;
   readonly clock?: () => Timestamp;
+  /**
+   * Gate on whether this process may act.
+   *
+   * Wired to the leader lock in production: a follower still serves the API,
+   * but must not decide or reconcile, because two processes acting on the same
+   * account place two orders for one intent. Defaults to always-true so tests
+   * and single-instance runs need not care.
+   */
+  readonly canTrade?: () => boolean;
 }
 
 export class LiveRunner {
@@ -51,6 +60,15 @@ export class LiveRunner {
   private lastReconcile = 0;
   private squaredOffOn = '';
   private running = false;
+  /**
+   * The tick currently in flight, if any.
+   *
+   * Held so shutdown can wait for it. A tick can be between "order persisted as
+   * PENDING_NEW" and "broker acknowledged"; exiting there leaves an order whose
+   * existence at the exchange is unknown until the next reconciliation. That is
+   * recoverable, but it is not something to do on every ordinary deploy.
+   */
+  private inFlight: Promise<void> | null = null;
 
   constructor(private readonly config: RunnerConfig) {
     this.tickIntervalMs = config.tickIntervalMs ?? 60_000;
@@ -69,10 +87,40 @@ export class LiveRunner {
     }, this.tickIntervalMs);
   }
 
+  /**
+   * Stops scheduling new ticks. Does not wait for one already running — see
+   * {@link drain} for that.
+   */
   stop(): void {
     this.running = false;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+  }
+
+  /**
+   * Stops the loop and waits for any tick already in flight.
+   *
+   * `timeoutMs` bounds the wait so a wedged broker call cannot block shutdown
+   * indefinitely — an orchestrator that gives up and sends SIGKILL is strictly
+   * worse than exiting deliberately, because it forfeits the chance to close
+   * the database cleanly. Resolves to whether the drain completed in time.
+   */
+  async drain(timeoutMs = 30_000): Promise<boolean> {
+    this.stop();
+    if (!this.inFlight) return true;
+
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), timeoutMs);
+    });
+
+    try {
+      // `inFlight` never rejects — tick() catches internally — so this settles
+      // on whichever comes first without needing a catch.
+      return await Promise.race([this.inFlight.then(() => true), timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   get isRunning(): boolean {
@@ -89,7 +137,23 @@ export class LiveRunner {
     if (this.ticking) return;
     this.ticking = true;
 
+    const run = this.runTick(now);
+    this.inFlight = run;
     try {
+      await run;
+    } finally {
+      this.inFlight = null;
+      this.ticking = false;
+    }
+  }
+
+  private async runTick(now: Timestamp): Promise<void> {
+    try {
+      // Checked every tick rather than once at start: leadership can be lost
+      // mid-session if the database connection drops, and the loop must go
+      // quiet the moment it is no longer the single writer.
+      if (this.config.canTrade && !this.config.canTrade()) return;
+
       if (now - this.lastReconcile >= this.reconcileIntervalMs && this.config.reconciler) {
         this.lastReconcile = now;
         await this.reconcile(now);
@@ -115,8 +179,6 @@ export class LiveRunner {
         detail: error instanceof Error ? error.message : String(error),
         at: now,
       });
-    } finally {
-      this.ticking = false;
     }
   }
 

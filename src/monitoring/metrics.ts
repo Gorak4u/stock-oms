@@ -269,5 +269,12 @@ export const METRICS = {
   drawdown: 'trading_drawdown_fraction',
   killSwitch: 'trading_kill_switch_engaged',
   queueDepth: 'trading_queue_depth',
+  queueDeadLetters: 'trading_queue_dead_letters',
   reconciliationBreaks: 'trading_reconciliation_breaks_open',
+  marketDataBarsStored: 'trading_market_data_bars_stored_total',
+  marketDataRejected: 'trading_market_data_bars_rejected_total',
+  marketDataErrors: 'trading_market_data_errors_total',
+  /** Epoch ms of the newest stored bar. Alert on `time() - this` to catch a stalled feed. */
+  marketDataLastBar: 'trading_market_data_last_bar_timestamp',
+  isLeader: 'trading_is_leader',
 } as const;

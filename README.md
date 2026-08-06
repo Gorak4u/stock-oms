@@ -3,11 +3,19 @@
 A resilient, auditable, single-user automated NSE trading platform.
 
 > **Status: complete stack, unproven strategies.** Every layer in the
-> architecture is built, tested and runs — API, persistence, messaging,
-> monitoring, containers, the live trading loop, and the operator dashboard.
+> architecture is built, tested and runs — market data ingestion, API,
+> persistence, messaging, monitoring, containers, the live trading loop, and the
+> operator dashboard. The operational machinery a live deployment needs is
+> there too: versioned migrations, leader election, a drained shutdown, broker
+> session refresh without a restart, and CI that exercises all of it against
+> real Postgres and Redis.
+>
 > What is *not* done is the part no amount of code can supply: the acceptance
-> criteria at the bottom of this file are unmet, because none of them can be
-> met without real NSE market data and time.
+> criteria at the bottom of this file are unmet, because none of them can be met
+> without real NSE market data and time. **The system being production-grade and
+> the strategies being worth running are different claims, and only the first is
+> supported.** A well-built machine for executing an unvalidated edge will
+> execute it faithfully all the way down.
 >
 > **Do not point this at a funded broker account.** It defaults to a paper
 > broker, and reaching a live one takes a deliberate configuration change. That
@@ -92,9 +100,13 @@ src/
                  portfolio, OMS
   backtest/      engine, metrics, walk-forward validation
   pipeline/      the workflow spine (manual / approval / automatic)
-  persistence/   schema, repository ports, Postgres and in-memory adapters
+  marketdata/    NSE calendar, tick→OHLC, validation, corporate actions,
+                 Kite and CSV history providers, the ingestion service
+  persistence/   versioned migrations, repository ports, Postgres and
+                 in-memory adapters, leader election
   messaging/     Redis queue with retries, dead-letter and crash recovery
-  monitoring/    metrics, health, alerts, trade reconciliation
+  monitoring/    metrics, health, alerts, durable alert delivery,
+                 trade reconciliation
   runtime/       trading service, live runner
   api/           Fastify REST + WebSocket
   main.ts        process entrypoint
@@ -117,7 +129,7 @@ Then open **http://localhost:8080** for the operator dashboard.
 ```bash
 npm install
 npm run typecheck
-npm test                # 537 tests
+npm test                # 638 tests
 npm run build && npm start
 
 npm run backtest        # terminal demo over a synthetic series
@@ -126,21 +138,92 @@ npm run build:console   # dist/console.html — interactive, open in a browser
 
 Requires Node 20+, Postgres 16 and Redis. The tests skip the Postgres and Redis
 suites (loudly) when neither is reachable, so the deterministic core stays
-testable on a bare machine.
+testable on a bare machine. CI sets `REQUIRE_INFRA=1`, which turns those skips
+into failures — a green build that silently ran neither adapter suite is worse
+than a red one.
+
+### Loading market data
+
+Nothing decides anything until the `candle` table has bars in it. The live loop
+reads from it, the backtester reads from it, and an empty table means a process
+that ticks quietly forever without placing a trade.
+
+```bash
+# From CSV files — how five years of history usually arrives
+npm run backfill -- --source csv --interval 1d \
+  --file NSE:RELIANCE=./data/reliance.csv \
+  --file NSE:TCS=./data/tcs.csv
+
+# From the broker (needs a live Kite session; capped by Kite's own limits)
+npm run backfill -- --source kite --symbols NSE:RELIANCE,NSE:TCS \
+  --interval 1d --from 2019-01-01
+```
+
+CSV columns are matched case-insensitively (`date,open,high,low,close,volume`);
+dates may be `YYYY-MM-DD`, `DD-MM-YYYY`, ISO, or epoch. A bare date is read as
+the IST session open, not UTC midnight — the latter lands on the previous
+trading day and would shift every bar in the file by a session.
+
+Re-running is safe: bars are upserted by `(symbol, interval, timestamp)`, so a
+corrected file overwrites what it should and changes nothing else. Once running
+with `BROKER=zerodha`, the process keeps the recent window current on its own.
 
 ### Configuration
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `API_TOKEN` | — | **Required.** Bearer token for mutating routes; ≥16 chars |
+| `API_TOKEN` | — | **Required.** Bearer token for every route; ≥16 chars |
 | `DATABASE_URL` | local Postgres | Connection string |
-| `REDIS_URL` | unset | Enables the Redis health check and queues |
+| `REDIS_URL` | unset | Enables the Redis health check and durable alerts |
 | `BROKER` | `paper` | `paper` or `zerodha` |
 | `KITE_API_KEY` / `KITE_ACCESS_TOKEN` | — | Required when `BROKER=zerodha` |
+| `KITE_API_SECRET` | — | Lets `/api/broker/session` exchange a `request_token` |
 | `OPENING_CASH` | `1000000` | Opening capital, in rupees |
 | `STRATEGY` | `trend` | `trend`, `meanReversion`, `momentum`, `volatility` |
 | `SYMBOLS` | empty | Comma-separated watchlist |
+| `BAR_INTERVAL` | `1m` | Bar size the loop trades on |
+| `MARKET_DATA_SYNC_MS` | `60000` | How often to pull fresh bars |
+| `MARKET_DATA_MAX_AGE_MS` | `900000` | Data older than this is unhealthy mid-session |
+| `API_PUBLIC_READS` | `false` | Serve reads without a token (see below) |
+| `CORS_ORIGINS` | empty | Browser origins allowed to call the API |
+| `RATE_LIMIT_PER_MINUTE` | `300` | Per-client request cap |
+| `ALERT_WEBHOOK_URL` | unset | Enables durable alert delivery via Redis |
+| `SHUTDOWN_DRAIN_MS` | `30000` | How long SIGTERM waits for a tick in flight |
+| `PGSSLMODE` | unset | `require`, `verify-full`, … for TLS to Postgres |
+| `PGPOOL_MAX` / `PG_STATEMENT_TIMEOUT_MS` | `10` / `15000` | Pool sizing and query timeout |
 | `RISK_PER_TRADE` / `MAX_POSITION` / `DAILY_LOSS_LIMIT` / `MAX_DRAWDOWN` | see below | Risk limits as fractions |
+
+### Access control
+
+**Every route requires the bearer token**, reads included. Reads change nothing,
+but they disclose the entire position book, the equity curve and the audit log —
+enough to trade against the account holder. `/health` and `/metrics` are the
+exceptions, because the container healthcheck and the metrics scraper have no
+token and neither discloses account data.
+
+`API_PUBLIC_READS=true` opens the read routes deliberately, for a dashboard
+behind a proxy that authenticates. Writes stay guarded regardless.
+
+The WebSocket authenticates too, via `?token=` — browsers cannot set headers on
+a handshake. That is the only place a token is accepted in a URL.
+
+### Running more than one instance
+
+A Postgres advisory lock elects a single leader. Followers serve the API, health
+and metrics, but never decide, ingest or reconcile — two processes acting on one
+account place two orders for one intent, and per-instance idempotency keys do
+not prevent it, because each derives its own key from its own decision.
+
+Leadership is checked every tick, not once at startup, so a leader that loses
+its database connection goes quiet rather than becoming a second writer.
+
+### Schema changes
+
+Migrations live in `src/persistence/migrations`, named `NNN_description.sql`,
+and are applied in order at startup: one transaction each, serialised by an
+advisory lock, and checksummed so editing an already-applied migration is
+refused rather than silently diverging from production. Add a new file; never
+edit an applied one.
 
 ## The workflow
 
@@ -186,13 +269,14 @@ be trading at all".
 
 ## API
 
-Reads are open; every mutating route needs `Authorization: Bearer $API_TOKEN`.
+Every route needs `Authorization: Bearer $API_TOKEN` except `/health` and
+`/metrics`. See [Access control](#access-control).
 
 | Route | Purpose |
 | --- | --- |
 | `GET /` | Operator dashboard |
-| `GET /health` | Health report; 503 when unhealthy |
-| `GET /metrics` | Prometheus exposition |
+| `GET /health` | Health report; 503 when unhealthy. **Open** |
+| `GET /metrics` | Prometheus exposition. **Open** |
 | `GET /api/status` | Mode, equity, kill switch, loss streak |
 | `GET /api/positions` · `/api/orders` · `/api/trades` · `/api/equity` | Portfolio |
 | `GET /api/risk` | Configured limits and current state |
@@ -201,8 +285,28 @@ Reads are open; every mutating route needs `Authorization: Bearer $API_TOKEN`.
 | `GET /api/approvals` · `POST /api/approvals/:key/{approve,reject}` | Approval queue |
 | `GET /api/audit` | Audit records and chain verification |
 | `GET /api/reconciliation` | Open breaks against the broker |
+| `POST /api/broker/session` | Supply the day's Kite `requestToken` or `accessToken` |
 | `POST /api/backtest` | Backtest a stored symbol |
-| `WS /ws` | Live status stream (best-effort) |
+| `WS /ws?token=…` | Live status stream (best-effort) |
+
+### The daily Kite login
+
+Kite access tokens expire around 07:30 IST and there is no refresh token — a
+human must visit the login URL and hand back the `request_token`. The platform
+persists the token, predicts the expiry from the clock, detects a rejected one
+from `TokenException`, and raises a **critical** alert naming the login URL.
+
+Supplying the new token takes no restart:
+
+```bash
+curl -X POST localhost:8080/api/broker/session \
+  -H "Authorization: Bearer $API_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"requestToken":"...from the login redirect...","actor":"alice"}'
+```
+
+With no valid token the process still starts and serves the API — that is the
+only way an operator can supply one. It reports `broker-session` as unhealthy
+until they do.
 
 ## Backtest console
 
@@ -217,37 +321,58 @@ asserts the two agree byte for byte, including at the padding boundaries.
 
 ## Testing
 
-537 tests. The parts worth calling out:
+638 tests. The parts worth calling out:
 
 - **One contract suite, two implementations.** The in-memory and Postgres
   repositories run the same 45 cases, so a divergence fails the build. It has
   already caught one.
-- **Live infrastructure.** The persistence and API suites run against real
-  Postgres; the queue suite against real Redis. They skip loudly, never
-  silently, when unavailable.
+- **Live infrastructure.** The persistence, API, migration and leader-election
+  suites run against real Postgres; the queue and alert-delivery suites against
+  real Redis. They skip loudly, never silently — and under `REQUIRE_INFRA=1`,
+  which CI sets, they fail instead of skipping.
 - **Numerical checks.** Options greeks are pinned against numerical derivatives
   and put-call parity; the crypto shim against published SHA-256 vectors.
+- **An end-to-end smoke test in CI.** It boots the real `main.js` against a real
+  database, asserts the health report, that a read without a token is refused,
+  and that SIGTERM drains rather than truncates. Unit tests cover every layer
+  and none of them would notice the entrypoint failing to wire them together.
 
 Jest runs serially (`maxWorkers: 1`) because the database-backed suites share
 one database and truncate between cases.
+
+Three bugs found by tests written during the production-readiness pass, kept as
+regressions: an empty CSV price cell parsing as ₹0 rather than being skipped;
+`CREATE TABLE IF NOT EXISTS` racing under concurrent migration appliers; and an
+advisory-lock key above 2³¹ splitting across `classid`/`objid` in `pg_locks`, so
+the leader's own heartbeat concluded it had lost a lock it still held — and
+stood down, producing the two leaders the lock exists to prevent.
 
 ## Roadmap
 
 Built and tested:
 
 - [x] Market data — NSE calendar, tick→OHLC, validation, corporate actions
+- [x] Market data ingestion — Kite historical and CSV providers, backfill CLI,
+      watermarked incremental sync, staleness health check
 - [x] Feature engineering and the AI layer, including the training pipeline
 - [x] Four strategies, plus options pricing and five defined-risk structures
 - [x] Risk engine, position sizing, kill switch
 - [x] Execution — costs, paper broker, Zerodha connector, portfolio, OMS
+- [x] Broker session lifecycle — persisted token, login-flow exchange, expiry
+      detection, refresh without a restart
 - [x] Backtesting — engine, metrics, walk-forward validation
-- [x] Persistence — Postgres schema, repositories, migrations
-- [x] Messaging — Redis queue with retries, dead-letter, crash recovery
+- [x] Persistence — versioned transactional migrations, repositories, pool
+      timeouts and TLS, leader election
+- [x] Messaging — Redis queue with retries, dead-letter, crash recovery, wired
+      to durable alert delivery
 - [x] Monitoring — metrics, health checks, alerting, trade reconciliation
-- [x] API — REST, WebSocket, token auth
+- [x] API — REST, WebSocket, token auth on every route, rate limiting, CORS
 - [x] Operator dashboard
-- [x] Live trading runner with session awareness and square-off
+- [x] Live trading runner with session awareness, square-off and a drained
+      shutdown
 - [x] Containers — Dockerfile and docker-compose
+- [x] CI — typecheck, tests against real Postgres and Redis, build, image, and
+      an end-to-end smoke test
 
 Deliberately not built:
 
@@ -272,9 +397,16 @@ that the machinery runs — on a random walk the strategies return roughly zero
 and walk-forward efficiency correctly reports the in-sample results as fitted
 noise. That is the system working, not a result.
 
-**The next step is data, not code.** Load real NSE history into the `candle`
-table, run the five-year backtest and walk-forward validation, and let those
-results decide whether any of these strategies deserves paper trading.
+**The next step is data, not code** — and there is now a supported way to load
+it. `npm run backfill` fills the `candle` table from a CSV dump or from the
+broker; see [Loading market data](#loading-market-data). What no amount of
+tooling supplies is the data itself, or the months of walk-forward and paper
+trading that have to follow before any of these strategies has earned real
+capital.
+
+Work through the list in order. Each item exists to fail cheaply: a strategy
+that dies in walk-forward costs nothing, and the same strategy discovered in
+live trading costs whatever it was sized to.
 
 ## Purpose
 

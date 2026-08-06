@@ -8,6 +8,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
+import { WebSocket } from 'ws';
 import type { FastifyInstance } from 'fastify';
 import { fromRupees, type Paise } from '../src/domain/money';
 import type { Candle, Fill } from '../src/domain/types';
@@ -20,6 +21,7 @@ import { PaperBroker } from '../src/execution/paperBroker';
 import { ZERO_COST_SCHEDULE } from '../src/execution/costs';
 import { HealthMonitor, MetricsRegistry } from '../src/monitoring/metrics';
 import { MarketCalendar } from '../src/marketdata/calendar';
+import { announceUnavailable } from './support/infra';
 
 const TOKEN = 'test-token-that-is-long-enough';
 const DATABASE_URL =
@@ -38,6 +40,14 @@ function postgresReachable(): boolean {
 }
 
 const POSTGRES_AVAILABLE = postgresReachable();
+
+if (!POSTGRES_AVAILABLE) {
+  // These tests still run against in-memory repositories, which is useful
+  // locally but is not the thing being verified: the point of this suite is the
+  // wiring against a real database. Under REQUIRE_INFRA the quiet downgrade is
+  // a failure.
+  announceUnavailable('Postgres', DATABASE_URL, 'the API suite against a real database');
+}
 
 function candle(ts: number, close: number): Candle {
   return {
@@ -102,12 +112,57 @@ describe('API', () => {
 
   const auth = { authorization: `Bearer ${TOKEN}` };
 
+  /** An authenticated GET. Reads require a token unless `publicReads` is set. */
+  const get = (url: string) => app.inject({ method: 'GET', url, headers: auth });
+
   // ---- auth --------------------------------------------------------------
 
   describe('authentication', () => {
-    it('lets reads through unauthenticated', async () => {
+    it('rejects a read with no token', async () => {
       const response = await app.inject({ method: 'GET', url: '/api/status' });
+      expect(response.statusCode).toBe(401);
+    });
+
+    it('accepts a read with a token', async () => {
+      const response = await get('/api/status');
       expect(response.statusCode).toBe(200);
+    });
+
+    it.each([
+      '/api/positions', '/api/orders', '/api/trades', '/api/equity',
+      '/api/audit', '/api/risk', '/api/reconciliation', '/api/symbols',
+    ])('requires a token for %s', async (url) => {
+      expect((await app.inject({ method: 'GET', url })).statusCode).toBe(401);
+    });
+
+    it('leaves health and metrics open for infrastructure probes', async () => {
+      // Injected without a token on purpose: the container healthcheck and the
+      // metrics scraper have none, and neither route discloses account data.
+      expect((await app.inject({ method: 'GET', url: '/health' })).statusCode).toBe(200);
+      expect((await app.inject({ method: 'GET', url: '/metrics' })).statusCode).toBe(200);
+    });
+
+    it('serves reads unauthenticated when publicReads is set', async () => {
+      const open = buildServer({
+        service,
+        repositories,
+        metrics: service.metrics,
+        health: new HealthMonitor(),
+        authToken: TOKEN,
+        publicReads: true,
+      });
+      await open.ready();
+      try {
+        expect((await open.inject({ method: 'GET', url: '/api/status' })).statusCode).toBe(200);
+        // Writes stay guarded regardless — publicReads is about disclosure,
+        // not about who may move money.
+        const write = await open.inject({
+          method: 'POST', url: '/api/mode', payload: { mode: 'AUTOMATIC' },
+        });
+        expect(write.statusCode).toBe(401);
+      } finally {
+        await open.close();
+      }
     });
 
     it('rejects a write with no token', async () => {
@@ -147,7 +202,7 @@ describe('API', () => {
 
   describe('GET /api/status', () => {
     it('reports opening state', async () => {
-      const body = (await app.inject({ method: 'GET', url: '/api/status' })).json();
+      const body = (await get('/api/status')).json();
       expect(body.equityRupees).toBe(1_000_000);
       expect(body.openPositions).toBe(0);
       expect(body.killSwitch.engaged).toBe(false);
@@ -164,7 +219,7 @@ describe('API', () => {
         payload: { mode: 'AUTOMATIC', actor: 'alice' },
       });
 
-      expect((await app.inject({ method: 'GET', url: '/api/status' })).json().mode).toBe('AUTOMATIC');
+      expect((await get('/api/status')).json().mode).toBe('AUTOMATIC');
       expect(await repositories.state.get('automation.mode')).toBe('AUTOMATIC');
     });
 
@@ -241,14 +296,14 @@ describe('API', () => {
     });
 
     it('lists open positions with rupee conveniences', async () => {
-      const body = (await app.inject({ method: 'GET', url: '/api/positions' })).json();
+      const body = (await get('/api/positions')).json();
       expect(body.positions).toHaveLength(1);
       expect(body.positions[0].symbol).toBe('NSE:TEST');
       expect(body.positions[0].averagePriceRupees).toBe(1000);
     });
 
     it('records an equity point', async () => {
-      const body = (await app.inject({ method: 'GET', url: '/api/equity' })).json();
+      const body = (await get('/api/equity')).json();
       expect(body.curve.length).toBeGreaterThan(0);
     });
 
@@ -259,7 +314,7 @@ describe('API', () => {
       };
       await service.applyFill(duplicate);
 
-      const body = (await app.inject({ method: 'GET', url: '/api/positions' })).json();
+      const body = (await get('/api/positions')).json();
       expect(body.positions[0].quantity).toBe(100);
     });
 
@@ -277,7 +332,7 @@ describe('API', () => {
         price: fromRupees(1100), timestamp: 2000, commission: 0 as Paise,
       });
 
-      const body = (await app.inject({ method: 'GET', url: '/api/trades' })).json();
+      const body = (await get('/api/trades')).json();
       expect(body.trades).toHaveLength(1);
       expect(body.trades[0].pnlRupees).toBe(10_000);
     });
@@ -291,9 +346,186 @@ describe('API', () => {
         method: 'POST', url: '/api/mode', headers: auth, payload: { mode: 'APPROVAL' },
       });
 
-      const body = (await app.inject({ method: 'GET', url: '/api/audit' })).json();
+      const body = (await get('/api/audit')).json();
       expect(body.chainIntact).toBe(true);
       expect(body.records.length).toBeGreaterThan(0);
+    });
+  });
+
+  // ---- websocket ---------------------------------------------------------
+
+  describe('WS /ws', () => {
+    /**
+     * Connects for real rather than via `inject`, which cannot do websockets.
+     *
+     * Resolves with the first frame, or with the handshake error — which is the
+     * assertion that matters here: an unauthorised client must be refused the
+     * upgrade outright, not handed a socket that is then closed.
+     */
+    function connect(url: string): Promise<{ frame?: unknown; error?: string }> {
+      return new Promise((resolve, reject) => {
+        const socket = new WebSocket(url);
+        const timer = setTimeout(() => {
+          socket.terminate();
+          reject(new Error('timed out waiting for a frame'));
+        }, 5000);
+
+        let settled = false;
+        const finish = (result: { frame?: unknown; error?: string }): void => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          socket.close();
+          resolve(result);
+        };
+
+        socket.on('message', (data: Buffer) => finish({ frame: JSON.parse(data.toString()) }));
+        socket.on('error', (error: Error) => finish({ error: error.message }));
+        socket.on('close', () => finish({ error: 'closed without a frame' }));
+      });
+    }
+
+    let listening: FastifyInstance;
+    let base: string;
+
+    beforeEach(async () => {
+      listening = buildServer({
+        service, repositories, metrics: service.metrics,
+        health: new HealthMonitor(), authToken: TOKEN,
+      });
+      const address = await listening.listen({ port: 0, host: '127.0.0.1' });
+      base = address.replace('http://', 'ws://');
+    });
+
+    afterEach(async () => {
+      await listening.close();
+    });
+
+    it('streams status to an authenticated socket', async () => {
+      const { frame } = await connect(`${base}/ws?token=${encodeURIComponent(TOKEN)}`);
+      expect(frame).toMatchObject({ type: 'status' });
+    });
+
+    it('refuses the upgrade for an unauthenticated client', async () => {
+      // This socket streams live equity and positions; leaving it open was the
+      // widest read hole, because it needed no polling to watch an account.
+      const result = await connect(`${base}/ws`);
+      expect(result.frame).toBeUndefined();
+      expect(result.error).toMatch(/401/);
+    });
+
+    it('refuses the upgrade for a wrong token', async () => {
+      const result = await connect(`${base}/ws?token=wrong-token-same-length-x`);
+      expect(result.frame).toBeUndefined();
+      expect(result.error).toMatch(/401/);
+    });
+  });
+
+  // ---- broker session ----------------------------------------------------
+
+  describe('POST /api/broker/session', () => {
+    function withSessionHandler(
+      handler: (input: { requestToken?: string; accessToken?: string; actor: string }) =>
+        Promise<{ expiresAt: number | null }>,
+    ): FastifyInstance {
+      return buildServer({
+        service, repositories, metrics: service.metrics,
+        health: new HealthMonitor(), authToken: TOKEN,
+        onBrokerSession: handler,
+      });
+    }
+
+    it('rejects an unauthenticated attempt to set the broker token', async () => {
+      const response = await app.inject({
+        method: 'POST', url: '/api/broker/session', payload: { requestToken: 'x' },
+      });
+      expect(response.statusCode).toBe(401);
+    });
+
+    it('404s when the configured broker has no session', async () => {
+      // The paper broker has nothing to refresh; saying so beats a 500.
+      const response = await app.inject({
+        method: 'POST', url: '/api/broker/session', headers: auth,
+        payload: { requestToken: 'x' },
+      });
+      expect(response.statusCode).toBe(404);
+    });
+
+    it('passes a request token through and reports the expiry', async () => {
+      const seen: unknown[] = [];
+      const server = withSessionHandler(async (input) => {
+        seen.push(input);
+        return { expiresAt: 1_700_000_000_000 };
+      });
+      await server.ready();
+
+      try {
+        const response = await server.inject({
+          method: 'POST', url: '/api/broker/session', headers: auth,
+          payload: { requestToken: 'req-123', actor: 'alice' },
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(response.json().expiresAt).toBe(1_700_000_000_000);
+        expect(seen).toEqual([{ requestToken: 'req-123', actor: 'alice' }]);
+      } finally {
+        await server.close();
+      }
+    });
+
+    it('accepts an access token obtained elsewhere', async () => {
+      const seen: unknown[] = [];
+      const server = withSessionHandler(async (input) => {
+        seen.push(input);
+        return { expiresAt: null };
+      });
+      await server.ready();
+
+      try {
+        const response = await server.inject({
+          method: 'POST', url: '/api/broker/session', headers: auth,
+          payload: { accessToken: 'tok-456' },
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(seen).toEqual([{ accessToken: 'tok-456', actor: 'api' }]);
+      } finally {
+        await server.close();
+      }
+    });
+
+    it('requires one of the two tokens', async () => {
+      const server = withSessionHandler(async () => ({ expiresAt: null }));
+      await server.ready();
+
+      try {
+        const response = await server.inject({
+          method: 'POST', url: '/api/broker/session', headers: auth, payload: {},
+        });
+        expect(response.statusCode).toBe(400);
+      } finally {
+        await server.close();
+      }
+    });
+
+    it('reports a rejected exchange as a broker failure, not a bad request', async () => {
+      const server = withSessionHandler(async () => {
+        throw new Error('token exchange failed: invalid request token');
+      });
+      await server.ready();
+
+      try {
+        const response = await server.inject({
+          method: 'POST', url: '/api/broker/session', headers: auth,
+          payload: { requestToken: 'stale' },
+        });
+
+        // 502: the operator should retry the login, not fix their payload.
+        expect(response.statusCode).toBe(502);
+        expect(response.json().error).toMatch(/invalid request token/);
+      } finally {
+        await server.close();
+      }
     });
   });
 
@@ -350,10 +582,10 @@ describe('API', () => {
     it('returns stored candles and symbols', async () => {
       await repositories.candles.upsertMany([candle(1000, 100), candle(2000, 110)]);
 
-      const candles = (await app.inject({ method: 'GET', url: '/api/candles/NSE:TEST' })).json();
+      const candles = (await get('/api/candles/NSE:TEST')).json();
       expect(candles.candles).toHaveLength(2);
 
-      const symbols = (await app.inject({ method: 'GET', url: '/api/symbols' })).json();
+      const symbols = (await get('/api/symbols')).json();
       expect(symbols.symbols).toContain('NSE:TEST');
     });
   });
@@ -362,7 +594,7 @@ describe('API', () => {
 
   describe('operational routes', () => {
     it('serves Prometheus metrics as text', async () => {
-      const response = await app.inject({ method: 'GET', url: '/metrics' });
+      const response = await get('/metrics');
       expect(response.statusCode).toBe(200);
       expect(response.headers['content-type']).toContain('text/plain');
       expect(response.body).toContain('trading_equity_paise');
@@ -402,7 +634,7 @@ describe('API', () => {
 
   describe('approvals', () => {
     it('is empty initially', async () => {
-      const body = (await app.inject({ method: 'GET', url: '/api/approvals' })).json();
+      const body = (await get('/api/approvals')).json();
       expect(body.approvals).toEqual([]);
     });
 

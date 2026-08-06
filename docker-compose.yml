@@ -28,8 +28,14 @@ services:
 
   redis:
     image: redis:7-alpine
-    # Persist to disk: the queue holds order submissions, which must survive a
-    # restart. An in-memory-only Redis would silently drop them.
+    # Persist to disk: the queue holds undelivered alerts, which must survive a
+    # restart. An in-memory-only Redis would drop exactly the alerts raised
+    # while something was already going wrong.
+    #
+    # Orders deliberately do *not* travel through this queue. The OMS persists
+    # its intent to Postgres before calling the broker and reconciles against
+    # the broker's own order book afterwards — a stronger guarantee than a
+    # queue provides, on the path that can least afford the added latency.
     command: ['redis-server', '--appendonly', 'yes']
     volumes:
       - redis-data:/data
@@ -55,17 +61,31 @@ services:
       BROKER: ${BROKER:-paper}
       KITE_API_KEY: ${KITE_API_KEY:-}
       KITE_ACCESS_TOKEN: ${KITE_ACCESS_TOKEN:-}
+      # Needed to exchange a request_token for the day's access token via
+      # POST /api/broker/session. Without it, a token must be supplied directly.
+      KITE_API_SECRET: ${KITE_API_SECRET:-}
       OPENING_CASH: ${OPENING_CASH:-1000000}
       STRATEGY: ${STRATEGY:-trend}
       SYMBOLS: ${SYMBOLS:-}
+      BAR_INTERVAL: ${BAR_INTERVAL:-1m}
+      MARKET_DATA_SYNC_MS: ${MARKET_DATA_SYNC_MS:-60000}
       RISK_PER_TRADE: ${RISK_PER_TRADE:-0.01}
       MAX_POSITION: ${MAX_POSITION:-0.1}
       DAILY_LOSS_LIMIT: ${DAILY_LOSS_LIMIT:-0.03}
       MAX_DRAWDOWN: ${MAX_DRAWDOWN:-0.15}
+      # Reads require the API token unless this is set. Only turn it on where
+      # something else authenticates — it publishes positions and the audit log.
+      API_PUBLIC_READS: ${API_PUBLIC_READS:-false}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
       PORT: 8080
     ports:
       - '8080:8080'
     restart: unless-stopped
+    # Longer than SHUTDOWN_DRAIN_MS (30s default) so a tick in flight finishes
+    # rather than being SIGKILLed between persisting an order and hearing back
+    # from the broker.
+    stop_grace_period: 45s
 
 volumes:
   postgres-data:
