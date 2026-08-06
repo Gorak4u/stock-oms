@@ -150,9 +150,17 @@ export function buildServer(config: ApiConfig): FastifyInstance {
   app.addHook('onRequest', async (request, reply) => {
     const path = request.url.split('?')[0] ?? '';
 
-    // Unauthenticated by necessity: the container healthcheck and the metrics
+    // Unauthenticated by necessity.
+    //
+    // `/health` and `/metrics`: the container healthcheck and the metrics
     // scraper have no token, and neither discloses account data.
-    if (path === '/health' || path === '/metrics') return;
+    //
+    // `/`: a browser cannot set an Authorization header when you navigate to a
+    // URL, so a token-guarded dashboard could not be opened at all. The page is
+    // an empty shell — every figure on it arrives through the authenticated
+    // `/api/*` routes below, and without a token it renders nothing. Serving
+    // the shell discloses no more than serving a login form does.
+    if (path === '/health' || path === '/metrics' || path === '/') return;
 
     // Mutating routes and the websocket authenticate themselves, the latter
     // because it also accepts a query token.

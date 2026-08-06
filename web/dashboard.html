@@ -147,8 +147,8 @@
     </div>
     <div class="controls">
       <span class="pill" id="mode-pill"><span class="dot"></span><span id="mode-label">…</span></span>
-      <span class="pill" id="conn-pill"><span class="dot"></span><span id="conn-label">connecting</span></span>
-      <input type="password" id="token" placeholder="API token" autocomplete="off">
+      <span class="pill" id="conn-pill"><span class="dot"></span><span id="conn-label">enter API token</span></span>
+      <input type="password" id="token" placeholder="API token — required to load" autocomplete="off">
     </div>
   </div>
 </header>
@@ -159,7 +159,7 @@
   <div class="panel">
     <div class="panel-head">
       <h2>Controls</h2>
-      <span class="eyebrow">Writes require the token</span>
+      <span class="eyebrow">Every route requires the token</span>
     </div>
     <div class="panel-body controls">
       <button type="button" data-mode="MANUAL">Manual</button>
@@ -247,10 +247,23 @@
     token = e.target.value.trim();
     sessionStorage.setItem("apiToken", token);
     toast(token ? "Token saved for this session" : "Token cleared");
+
+    // Load immediately rather than after the next ten-second tick, and open the
+    // live socket, which cannot connect until there is a token to present.
+    if (token) {
+      refresh();
+      if (!socket || socket.readyState > 1) connect();
+    }
   });
 
+  // Reads are authenticated too. They change nothing, but they disclose the
+  // position book, the equity curve and the audit log — enough to trade
+  // against this account. A 401 is reported as "enter the token" rather than
+  // as a generic failure, because that is what it always means here.
   function get(path) {
-    return fetch(path).then(function (r) {
+    var headers = token ? { Authorization: "Bearer " + token } : {};
+    return fetch(path, { headers: headers }).then(function (r) {
+      if (r.status === 401) throw new Error("unauthorised");
       if (!r.ok) throw new Error("HTTP " + r.status);
       return r.json();
     });
@@ -456,6 +469,14 @@
   // ---- polling & live socket --------------------------------------------
 
   function refresh() {
+    // Nothing on this page is readable without a token, so say so once rather
+    // than failing seven fetches every ten seconds.
+    if (!token) {
+      $("conn-pill").className = "pill halted";
+      $("conn-label").textContent = "enter API token";
+      return;
+    }
+
     Promise.all([
       get("/api/status"), get("/api/positions"), get("/api/approvals"),
       get("/api/orders?limit=40"), get("/api/trades?limit=40"),
@@ -468,12 +489,25 @@
       renderTrades(r[4].trades);
       renderEquity(r[5].curve);
       renderBreaks(r[6].breaks);
-    }).catch(function (e) { toast("Refresh failed: " + e.message, true); });
+    }).catch(function (e) {
+      toast(e.message === "unauthorised"
+        ? "Enter the API token to load the dashboard"
+        : "Refresh failed: " + e.message, true);
+    });
   }
 
+  var socket = null;
+
   function connect() {
+    // The server refuses the upgrade without a token, so connecting before one
+    // is entered would just reconnect in a loop.
+    if (!token) return;
+
     var protocol = location.protocol === "https:" ? "wss:" : "ws:";
-    var socket = new WebSocket(protocol + "//" + location.host + "/ws");
+    // A token in the query string is the only way to authenticate a websocket:
+    // browsers cannot set headers on the handshake.
+    var url = protocol + "//" + location.host + "/ws?token=" + encodeURIComponent(token);
+    socket = new WebSocket(url);
 
     socket.addEventListener("open", function () {
       $("conn-pill").className = "pill live";
@@ -487,8 +521,10 @@
     });
     socket.addEventListener("close", function () {
       $("conn-pill").className = "pill halted";
-      $("conn-label").textContent = "reconnecting";
-      setTimeout(connect, 3000);
+      // A closed socket with no token is a rejected handshake, not a blip;
+      // retrying would loop until one is entered.
+      $("conn-label").textContent = token ? "reconnecting" : "enter API token";
+      if (token) setTimeout(connect, 3000);
     });
     socket.addEventListener("error", function () { socket.close(); });
   }

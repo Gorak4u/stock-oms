@@ -135,6 +135,23 @@ describe('API', () => {
       expect((await app.inject({ method: 'GET', url })).statusCode).toBe(401);
     });
 
+    it('serves the dashboard shell without a token', async () => {
+      // A browser cannot set an Authorization header when you navigate to a
+      // URL, so guarding this would make the dashboard impossible to open at
+      // all. The shell holds no data — every figure arrives through the
+      // authenticated /api routes.
+      const response = await app.inject({ method: 'GET', url: '/' });
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toMatch(/text\/html/);
+    });
+
+    it('the dashboard shell discloses no account data', async () => {
+      // The guarantee that makes serving it unauthenticated acceptable.
+      const body = (await app.inject({ method: 'GET', url: '/' })).body;
+      expect(body).not.toContain(TOKEN);
+      expect(body).toMatch(/id="token"/);
+    });
+
     it('leaves health and metrics open for infrastructure probes', async () => {
       // Injected without a token on purpose: the container healthcheck and the
       // metrics scraper have none, and neither route discloses account data.
