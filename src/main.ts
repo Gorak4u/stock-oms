@@ -381,6 +381,9 @@ export async function main(): Promise<void> {
     candles: repositories.candles,
     reconciler,
     alerts,
+    // The same interval ingestion writes. Reading a different one is a silent
+    // no-op: fresh bars land in one series and the strategy reads another.
+    interval: barInterval,
     canTrade: () => leader.isLeader,
   });
 

@@ -211,6 +211,37 @@ function dailyBars(count: number, seed = 7): Candle[] {
   return out;
 }
 
+describe('bar interval', () => {
+  it('reads the interval it was configured with, not a hardcoded one', async () => {
+    // The trap: ingestion took its interval from configuration while the loop
+    // hardcoded 1m, so raising the bar size wrote one series and read another.
+    // The market-data health check went green against bars the strategy never
+    // saw, and the loop ticked forever on an empty read.
+    const { svc, repositories } = service();
+    await svc.start();
+
+    let bars = 0;
+    (svc as unknown as { onBar: () => Promise<void> }).onBar = async () => {
+      bars += 1;
+    };
+
+    // Only 5m bars exist.
+    await repositories.candles.upsertMany(
+      minuteBars(120).map((c) => ({ ...c, interval: '5m' as const })),
+    );
+
+    const readingOneMinute = new LiveRunner({ service: svc, candles: repositories.candles });
+    await readingOneMinute.tick(fromIst('2026-03-02', 11 * 60));
+    expect(bars).toBe(0);
+
+    const readingFiveMinute = new LiveRunner({
+      service: svc, candles: repositories.candles, interval: '5m',
+    });
+    await readingFiveMinute.tick(fromIst('2026-03-02', 11 * 60));
+    expect(bars).toBe(1);
+  });
+});
+
 describe('state survives a restart', () => {
   /**
    * The invariant tradingService.ts opens by claiming: replaying fills means a

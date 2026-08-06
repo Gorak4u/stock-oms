@@ -11,7 +11,7 @@
  * decide against a half-updated portfolio.
  */
 
-import type { Timestamp } from '../domain/types';
+import type { Interval, Timestamp } from '../domain/types';
 import { toIstDate, type MarketCalendar } from '../marketdata/calendar';
 import type { TradingService } from './tradingService';
 import type { Reconciler } from '../monitoring/reconciliation';
@@ -35,6 +35,15 @@ export interface RunnerConfig {
   readonly squareOffMinutesBeforeClose?: number;
   /** Bars of history handed to the strategy each tick. */
   readonly historyBars?: number;
+  /**
+   * Bar size the loop trades on. Must match what ingestion is writing.
+   *
+   * Previously hardcoded to `1m` here while ingestion took its interval from
+   * configuration, so raising the bar size wrote one series and read another:
+   * the health check went green against fresh bars the strategy never saw, and
+   * the loop ticked forever on an empty read.
+   */
+  readonly interval?: Interval;
   readonly clock?: () => Timestamp;
   /**
    * Gate on whether this process may act.
@@ -52,6 +61,7 @@ export class LiveRunner {
   private readonly reconcileIntervalMs: number;
   private readonly squareOffMinutes: number;
   private readonly historyBars: number;
+  private readonly interval: Interval;
   private readonly clock: () => Timestamp;
   private readonly calendar: MarketCalendar;
 
@@ -75,6 +85,7 @@ export class LiveRunner {
     this.reconcileIntervalMs = config.reconcileIntervalMs ?? 300_000;
     this.squareOffMinutes = config.squareOffMinutesBeforeClose ?? 20;
     this.historyBars = config.historyBars ?? 400;
+    this.interval = config.interval ?? '1m';
     this.clock = config.clock ?? (() => Date.now());
     this.calendar = config.service.calendar;
   }
@@ -168,7 +179,7 @@ export class LiveRunner {
       }
 
       for (const symbol of this.config.service.watchlist) {
-        const history = await this.config.candles.latest(symbol, '1m', this.historyBars);
+        const history = await this.config.candles.latest(symbol, this.interval, this.historyBars);
         if (history.length < 60) continue;
         await this.config.service.onBar(symbol, history);
       }
