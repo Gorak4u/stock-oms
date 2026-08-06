@@ -164,12 +164,13 @@ export function buildServer(config: ApiConfig): FastifyInstance {
     // `/health` and `/metrics`: the container healthcheck and the metrics
     // scraper have no token, and neither discloses account data.
     //
-    // `/`: a browser cannot set an Authorization header when you navigate to a
-    // URL, so a token-guarded dashboard could not be opened at all. The page is
-    // an empty shell — every figure on it arrives through the authenticated
-    // `/api/*` routes below, and without a token it renders nothing. Serving
-    // the shell discloses no more than serving a login form does.
-    if (path === '/health' || path === '/metrics' || path === '/') return;
+    // `/` and `/console`: a browser cannot set an Authorization header when you
+    // navigate to a URL, so a token-guarded page could not be opened at all.
+    // Both are empty shells — every figure on the dashboard arrives through the
+    // authenticated `/api/*` routes below, and the console computes everything
+    // client-side from data you give it. Serving them discloses no more than
+    // serving a login form does.
+    if (path === '/health' || path === '/metrics' || path === '/' || path === '/console') return;
 
     // Mutating routes and the websocket authenticate themselves, the latter
     // because it also accepts a query token.
@@ -187,30 +188,60 @@ export function buildServer(config: ApiConfig): FastifyInstance {
     return typeof body?.actor === 'string' && body.actor.trim() ? body.actor.trim() : 'api';
   }
 
-  // ---- dashboard ---------------------------------------------------------
+  // ---- pages -------------------------------------------------------------
 
   /**
-   * The operator dashboard, read once at boot.
+   * Reads a page from the first candidate path that exists.
    *
-   * Read at startup rather than per request so a missing file fails loudly
-   * when the process starts, not silently on the first page load — and so a
-   * container without the `web` directory cannot appear healthy.
+   * Read at startup rather than per request so a missing file fails loudly when
+   * the process starts, not silently on the first page load — and so a
+   * container built without its assets cannot appear healthy.
    */
-  const dashboard = (() => {
-    for (const candidate of [
-      join(__dirname, '..', '..', 'web', 'dashboard.html'),
-      join(process.cwd(), 'web', 'dashboard.html'),
-    ]) {
+  function loadPage(...candidates: string[]): string | null {
+    for (const candidate of candidates) {
       if (existsSync(candidate)) return readFileSync(candidate, 'utf8');
     }
     return null;
-  })();
+  }
+
+  const dashboard = loadPage(
+    join(__dirname, '..', '..', 'web', 'dashboard.html'),
+    join(process.cwd(), 'web', 'dashboard.html'),
+  );
+
+  /**
+   * The backtest console, served by the same process.
+   *
+   * It is the same application: one build, one deploy, one URL. The console
+   * happens to run its half in the browser — it is the platform core compiled
+   * for the browser rather than a separate product — but that is an
+   * implementation detail of the page, not a reason to host it somewhere else.
+   *
+   * Produced by `npm run build`, which runs `build-console.js` into `dist`.
+   */
+  const backtestConsole = loadPage(
+    join(__dirname, '..', 'console.html'),
+    join(__dirname, '..', '..', 'dist', 'console.html'),
+    join(process.cwd(), 'dist', 'console.html'),
+  );
+
+  const html = (reply: FastifyReply, body: string) =>
+    reply.header('Content-Type', 'text/html; charset=utf-8').send(body);
 
   app.get('/', async (_request, reply) => {
     if (!dashboard) {
       return reply.code(404).send({ error: 'dashboard asset not found (web/dashboard.html)' });
     }
-    return reply.header('Content-Type', 'text/html; charset=utf-8').send(dashboard);
+    return html(reply, dashboard);
+  });
+
+  app.get('/console', async (_request, reply) => {
+    if (!backtestConsole) {
+      return reply.code(404).send({
+        error: 'backtest console not built — run `npm run build`',
+      });
+    }
+    return html(reply, backtestConsole);
   });
 
   // ---- health & metrics --------------------------------------------------

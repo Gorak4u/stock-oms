@@ -1,16 +1,32 @@
 # Deployment
 
-There are two deployable artifacts in this repository, and they go to different
-kinds of host. Conflating them is the mistake worth avoiding, because one of the
-two failure modes is silent.
+**This is one application.** One build, one process, one URL:
 
-| Artifact | What it is | Where it goes |
-| --- | --- | --- |
-| **The engine** (`dist/main.js`) | Long-running process: tick loop, held database lock, in-memory risk state, ingestion timer | A container host — Fly.io, Render, Railway, ECS, a VPS |
-| **The backtest console** (`public/index.html`) | One self-contained HTML file, the real engine compiled for the browser | Any static host — Vercel, Netlify, GitHub Pages, S3 |
-| **The trading dashboard** (`public/dashboard.html`) | A shell that reads a live engine over the API | Either — the engine serves it at `/`, or a static host points it at the engine |
+| Route | What |
+| --- | --- |
+| `/` | Trading dashboard |
+| `/console` | Backtest console |
+| `/api/*` | REST API |
+| `/ws` | Live status stream |
+| `/health`, `/metrics` | Probes |
 
-Both *interfaces* can live on a CDN. Only the engine needs a real process.
+```bash
+npm run build && npm start
+```
+
+Deploy it to anything that runs a container or a long-lived Node process —
+Fly.io, Render, Railway, a VPS. `fly.toml`, `render.yaml` and
+`docker-compose.yml` are in the repo. That is the whole story; the rest of this
+document is detail.
+
+## What it needs
+
+Node 20+, **Postgres 16**, and optionally Redis (for durable alert delivery).
+Run **exactly one instance** — a second comes up read-only by design, so it
+costs money without trading.
+
+It cannot run on a serverless host. Not a config problem, and not merely the
+websocket: see [why](#why-the-engine-cannot-run-serverless) below.
 
 ## Why the engine cannot run serverless
 
@@ -52,11 +68,7 @@ first table into Postgres and driving ticks from cron. That is a rewrite of the
 code that protects capital, in exchange for saving a few dollars a month on a
 small always-on instance.
 
-## The platform
-
-Requirements: somewhere that runs a container, **Postgres 16**, and optionally
-Redis (for durable alert delivery). Run **exactly one instance** — a second one
-comes up read-only by design, so it costs money without trading.
+## Hosts
 
 ### Fly.io
 
@@ -114,39 +126,30 @@ in flight before exiting, so give the orchestrator at least 45 seconds before it
 resorts to SIGKILL. `docker-compose.yml` sets `stop_grace_period: 45s` and
 `fly.toml` sets `kill_timeout = "45s"` for this reason.
 
-## The interfaces on a CDN
+## Optional: the pages on a CDN as well
 
-`npm run build:static` produces a `public/` directory with three files:
+**You do not need this.** The application serves both pages itself, and one
+deploy is the simpler and intended setup. This section exists for one case:
+publishing the backtest console on a public URL without exposing the engine
+that trades.
 
-```
-public/index.html       the backtest console (also at /console.html)
-public/dashboard.html   the trading dashboard
-public/console.html
-```
-
-`vercel.json` already wires this up, so a Vercel deploy needs no environment
-variables and no secrets. The same directory works on Netlify (publish
-`public/`, build `npm run build:static`), GitHub Pages, or any object store.
+The console holds no keys, reaches no broker, and cannot place an order — it is
+the platform core compiled for the browser, computing everything client-side
+from data you give it. That makes it safe to publish in a way the engine is not.
 
 ```bash
-npm run build:static
-npx vercel deploy        # or connect the repo in the Vercel dashboard
+npm run build:static     # → public/
+npx vercel deploy        # vercel.json is already wired up; no env vars, no secrets
 ```
 
-### The console
+`public/` mirrors the application's own routes — `index.html` is the dashboard,
+`console.html` the console — so links behave identically whichever serves them.
+The same directory works on Netlify, GitHub Pages, or any object store.
 
-Runs the **real engine** — the same strategy, risk, sizing, cost and fill code
-as the Node build, compiled to the browser — so its results match
-`npm run backtest` exactly. It reads synthetic data or your own OHLC CSV and
-shows which risk control refused each signal.
+### Pointing a CDN-hosted dashboard at the engine
 
-It holds no keys, reaches no broker, and cannot place an order. Publishing it
-exposes nothing about your account, which is why it is safe on a public URL.
-
-### The dashboard, pointed at a remote engine
-
-The dashboard is a shell; every figure arrives over the API. When a CDN serves
-it, it needs to know where the engine is:
+Only relevant if you serve the dashboard from the CDN too. It is a shell; every
+figure arrives over the API, so it needs to know where the engine is:
 
 1. Open the deployed dashboard and put the engine's public URL in the **API
    URL** field — e.g. `https://stock-oms.fly.dev`. Stored in `localStorage`,

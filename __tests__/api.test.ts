@@ -135,6 +135,16 @@ describe('API', () => {
       expect((await app.inject({ method: 'GET', url })).statusCode).toBe(401);
     });
 
+    it('serves the backtest console from the same process', async () => {
+      // One application: the console is the platform core compiled for the
+      // browser, not a separate product to host elsewhere. A 404 here means
+      // `npm run build` did not produce dist/console.html.
+      const response = await app.inject({ method: 'GET', url: '/console' });
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toMatch(/text\/html/);
+      expect(response.body).toMatch(/backtest/i);
+    });
+
     it('serves the dashboard shell without a token', async () => {
       // A browser cannot set an Authorization header when you navigate to a
       // URL, so guarding this would make the dashboard impossible to open at

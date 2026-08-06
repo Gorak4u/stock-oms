@@ -126,20 +126,17 @@ Then open **http://localhost:8080** for the operator dashboard.
 
 ### Deploying
 
-Both **interfaces** are static and deploy to any CDN — `npm run build:static`
-stages the backtest console and the trading dashboard into `public/`, and
-`vercel.json` wires it up with no secrets involved.
-
-The **engine** needs a host that runs a long-lived process — Fly.io, Render,
-Railway, a VPS. It cannot run serverless, and not merely for want of a websocket:
-the square-off guard, the drawdown and daily-loss baselines, and staged
-approvals all live in memory, so an environment that forgets between
-invocations turns the kill switches silently inert. `fly.toml`, `render.yaml`
+One application, one deploy. The process serves the dashboard at `/`, the
+backtest console at `/console`, the API at `/api/*` and the live stream at
+`/ws`. Deploy it to anything that runs a container — `fly.toml`, `render.yaml`
 and `docker-compose.yml` are in the repo.
 
-To run the dashboard from a CDN against a remote engine, set its **API URL**
-field and add that CDN origin to the engine's `CORS_ORIGINS`. See
-**[DEPLOYMENT.md](DEPLOYMENT.md)**.
+It cannot run on a serverless host, and not merely for want of a websocket: the
+square-off guard, the drawdown and daily-loss baselines and staged approvals all
+live in memory, so an environment that forgets between invocations turns the
+kill switches silently inert.
+
+See **[DEPLOYMENT.md](DEPLOYMENT.md)**.
 
 ### Locally
 
@@ -291,7 +288,8 @@ Every route needs `Authorization: Bearer $API_TOKEN` except `/health` and
 
 | Route | Purpose |
 | --- | --- |
-| `GET /` | Operator dashboard |
+| `GET /` | Operator dashboard. **Open** (a shell; its data is not) |
+| `GET /console` | Backtest console. **Open** (computes client-side, reaches nothing) |
 | `GET /health` | Health report; 503 when unhealthy. **Open** |
 | `GET /metrics` | Prometheus exposition. **Open** |
 | `GET /api/status` | Mode, equity, kill switch, loss streak |
@@ -327,11 +325,15 @@ until they do.
 
 ## Backtest console
 
-`npm run build:console` produces a self-contained `dist/console.html` that runs
-the **real engine** compiled to the browser — same strategy, risk, sizing, cost
-and fill code as the Node build, so results match `npm run backtest` exactly. It
-takes synthetic data or your own OHLC CSV, and surfaces which risk control
-refused each signal.
+Served at **`/console`** by the running platform — the same application, not a
+separate one. `npm run build` produces it as part of the normal build.
+
+It runs the **real engine** compiled to the browser — same strategy, risk,
+sizing, cost and fill code as the Node build, so results match `npm run backtest`
+exactly. It takes synthetic data or your own OHLC CSV, and surfaces which risk
+control refused each signal. Because it computes entirely client-side and
+reaches nothing, it is also the one page that can be published on its own
+(`npm run build:static`) without exposing the engine.
 
 `node:crypto` is aliased to a pure-JS SHA-256 for that bundle; the test suite
 asserts the two agree byte for byte, including at the padding boundaries.
