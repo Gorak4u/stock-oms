@@ -112,12 +112,18 @@ jobs:
       - name: Build the browser console
         run: npm run build:console
 
+      # Vercel rejects unknown properties, and reports it at deploy time in
+      # someone else's dashboard. Catch it here instead.
+      - name: Validate vercel.json
+        run: node scripts/check-vercel-config.js
+
       # The static-site build is what a CDN host runs; breaking it would only
       # surface as a failed deploy otherwise.
       - name: Stage the static site
         run: |
           npm run build:static
           test -s public/index.html
+          test -s public/dashboard.html
 
       # Guards the failure mode the asset copier exists to prevent: a container
       # that builds cleanly and then dies on its first migrate() call because

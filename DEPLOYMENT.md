@@ -169,6 +169,24 @@ it was already authorised to receive.
 Leave the API URL blank when the engine serves the dashboard itself — that is
 the same-origin case and needs no CORS at all.
 
+### The content security policy
+
+`vercel.json` sets a `default-src 'none'` policy, with two deliberate openings:
+
+- **`script-src`/`style-src 'unsafe-inline'`** — the console inlines the whole
+  engine and its styles into one file. That is what makes it self-contained.
+- **`connect-src https: wss:`** plus localhost — the dashboard's API endpoint is
+  typed in at runtime, so it cannot be a fixed allowlist. Localhost is included
+  so the same published page can drive an engine on your own machine.
+
+Everything else stays denied: no frames, no form posts, no base-URI rewriting.
+
+`vercel.json` is validated in CI by `scripts/check-vercel-config.js`. Vercel
+rejects unknown properties rather than ignoring them — and since JSON has no
+comment syntax, the tempting `"comment"` key next to a header is exactly what
+gets rejected, at deploy time. Hence the check, and hence this section rather
+than a comment in the file.
+
 ### A note on what this publishes
 
 Putting the dashboard on a public URL publishes the *shell*, not the data. It
