@@ -369,6 +369,107 @@ describe('API', () => {
     });
   });
 
+  // ---- cors --------------------------------------------------------------
+
+  describe('CORS', () => {
+    const CDN = 'https://stock-oms.vercel.app';
+
+    function withCors(origins: string[]): FastifyInstance {
+      return buildServer({
+        service, repositories, metrics: service.metrics,
+        health: new HealthMonitor(), authToken: TOKEN,
+        corsOrigins: origins,
+      });
+    }
+
+    it('sends no allow-origin header when no origins are configured', async () => {
+      // Default-deny: a browser on another origin cannot read the API at all
+      // unless someone deliberately allowed it.
+      const response = await app.inject({
+        method: 'GET', url: '/api/status', headers: { ...auth, origin: CDN },
+      });
+      expect(response.headers['access-control-allow-origin']).toBeUndefined();
+    });
+
+    it('permits the Authorization header on preflight', async () => {
+      // Every route authenticates with a bearer token, so a preflight that does
+      // not permit Authorization fails every cross-origin read while looking
+      // like a network fault.
+      const server = withCors([CDN]);
+      await server.ready();
+
+      try {
+        const response = await server.inject({
+          method: 'OPTIONS', url: '/api/status',
+          headers: {
+            origin: CDN,
+            'access-control-request-method': 'GET',
+            'access-control-request-headers': 'authorization',
+          },
+        });
+
+        expect(response.statusCode).toBeLessThan(300);
+        expect(response.headers['access-control-allow-origin']).toBe(CDN);
+        expect(String(response.headers['access-control-allow-headers']).toLowerCase())
+          .toContain('authorization');
+      } finally {
+        await server.close();
+      }
+    });
+
+    it('allows a configured origin and refuses an unconfigured one', async () => {
+      const server = withCors([CDN]);
+      await server.ready();
+
+      try {
+        const allowed = await server.inject({
+          method: 'GET', url: '/api/status', headers: { ...auth, origin: CDN },
+        });
+        expect(allowed.headers['access-control-allow-origin']).toBe(CDN);
+
+        const refused = await server.inject({
+          method: 'GET', url: '/api/status',
+          headers: { ...auth, origin: 'https://evil.example' },
+        });
+        expect(refused.headers['access-control-allow-origin']).not.toBe('https://evil.example');
+      } finally {
+        await server.close();
+      }
+    });
+
+    it('does not let an allowed origin bypass authentication', async () => {
+      // CORS decides which origin may *read a response*; it is not a grant of
+      // access. An allowed origin with no token must still be refused.
+      const server = withCors([CDN]);
+      await server.ready();
+
+      try {
+        const response = await server.inject({
+          method: 'GET', url: '/api/status', headers: { origin: CDN },
+        });
+        expect(response.statusCode).toBe(401);
+      } finally {
+        await server.close();
+      }
+    });
+
+    it('does not allow credentialed requests', async () => {
+      // The token travels in a header, not a cookie. Allowing credentials would
+      // widen what a hostile page could do with an existing session for nothing.
+      const server = withCors([CDN]);
+      await server.ready();
+
+      try {
+        const response = await server.inject({
+          method: 'GET', url: '/api/status', headers: { ...auth, origin: CDN },
+        });
+        expect(response.headers['access-control-allow-credentials']).toBeUndefined();
+      } finally {
+        await server.close();
+      }
+    });
+  });
+
   // ---- websocket ---------------------------------------------------------
 
   describe('WS /ws', () => {

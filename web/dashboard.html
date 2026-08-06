@@ -148,7 +148,14 @@
     <div class="controls">
       <span class="pill" id="mode-pill"><span class="dot"></span><span id="mode-label">…</span></span>
       <span class="pill" id="conn-pill"><span class="dot"></span><span id="conn-label">enter API token</span></span>
+      <!--
+        Blank means same-origin, which is the case when the platform serves this
+        page itself. It is only needed when the dashboard is hosted separately
+        (a CDN) from the engine — then it points at the engine's public URL.
+      -->
+      <input type="text" id="api-base" placeholder="API URL (blank = same origin)" autocomplete="off">
       <input type="password" id="token" placeholder="API token — required to load" autocomplete="off">
+      <a class="pill" href="./console.html">Backtest console →</a>
     </div>
   </div>
 </header>
@@ -239,6 +246,28 @@
     setTimeout(function () { el.className = "toast"; }, 3200);
   }
 
+  // Where the engine lives.
+  //
+  // Empty means same origin — the case when the platform serves this page
+  // itself. When the dashboard is hosted on a CDN and the engine runs
+  // elsewhere, this points at the engine and its origin must appear in the
+  // engine's CORS_ORIGINS.
+  //
+  // localStorage, unlike the token: an endpoint is configuration, not a secret,
+  // and retyping it every session would be tedious.
+  var apiBase = (localStorage.getItem("apiBase") || "").replace(/\/+$/, "");
+  $("api-base").value = apiBase;
+  $("api-base").addEventListener("change", function (e) {
+    apiBase = e.target.value.trim().replace(/\/+$/, "");
+    localStorage.setItem("apiBase", apiBase);
+    toast(apiBase ? "API set to " + apiBase : "Using same origin");
+    reconnect();
+  });
+
+  function api(path) {
+    return apiBase + path;
+  }
+
   // The token lives in sessionStorage, not localStorage: it should not
   // outlive the browser session on a shared machine.
   var token = sessionStorage.getItem("apiToken") || "";
@@ -250,11 +279,15 @@
 
     // Load immediately rather than after the next ten-second tick, and open the
     // live socket, which cannot connect until there is a token to present.
-    if (token) {
-      refresh();
-      if (!socket || socket.readyState > 1) connect();
-    }
+    if (token) reconnect();
   });
+
+  // Re-reads against whatever endpoint and token are now set. Used whenever
+  // either changes, so the page never sits stale behind a corrected setting.
+  function reconnect() {
+    refresh();
+    if (token && (!socket || socket.readyState > 1)) connect();
+  }
 
   // Reads are authenticated too. They change nothing, but they disclose the
   // position book, the equity curve and the audit log — enough to trade
@@ -262,7 +295,7 @@
   // as a generic failure, because that is what it always means here.
   function get(path) {
     var headers = token ? { Authorization: "Bearer " + token } : {};
-    return fetch(path, { headers: headers }).then(function (r) {
+    return fetch(api(path), { headers: headers }).then(function (r) {
       if (r.status === 401) throw new Error("unauthorised");
       if (!r.ok) throw new Error("HTTP " + r.status);
       return r.json();
@@ -274,7 +307,7 @@
       toast("Enter the API token first — writes are authenticated", true);
       return Promise.reject(new Error("no token"));
     }
-    return fetch(path, {
+    return fetch(api(path), {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
       body: JSON.stringify(body || {}),
@@ -490,9 +523,18 @@
       renderEquity(r[5].curve);
       renderBreaks(r[6].breaks);
     }).catch(function (e) {
-      toast(e.message === "unauthorised"
-        ? "Enter the API token to load the dashboard"
-        : "Refresh failed: " + e.message, true);
+      if (e.message === "unauthorised") {
+        return toast("Enter the API token to load the dashboard", true);
+      }
+      // A blocked cross-origin request reaches JS as a bare TypeError with no
+      // status, so the browser's own message is useless. Name the likely cause
+      // rather than making someone read the console to find it.
+      if (apiBase && e instanceof TypeError) {
+        return toast(
+          "Cannot reach " + apiBase + " — check the URL, and that this origin (" +
+          location.origin + ") is in the engine's CORS_ORIGINS", true);
+      }
+      toast("Refresh failed: " + e.message, true);
     });
   }
 
@@ -503,11 +545,21 @@
     // is entered would just reconnect in a loop.
     if (!token) return;
 
-    var protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    // Derived from the API endpoint, not from this page's location — when the
+    // dashboard is on a CDN the socket must reach the engine, not the CDN.
+    var origin = apiBase || location.origin;
+    var wsOrigin = origin.replace(/^http/, "ws");
+
     // A token in the query string is the only way to authenticate a websocket:
     // browsers cannot set headers on the handshake.
-    var url = protocol + "//" + location.host + "/ws?token=" + encodeURIComponent(token);
-    socket = new WebSocket(url);
+    var url = wsOrigin + "/ws?token=" + encodeURIComponent(token);
+
+    try {
+      socket = new WebSocket(url);
+    } catch (e) {
+      // A malformed endpoint must not break the page; polling still works.
+      return;
+    }
 
     socket.addEventListener("open", function () {
       $("conn-pill").className = "pill live";

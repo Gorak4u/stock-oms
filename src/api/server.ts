@@ -97,13 +97,22 @@ export function buildServer(config: ApiConfig): FastifyInstance {
   });
 
   // Default-deny: with no configured origins, no browser origin is allowed and
-  // the plugin is not registered at all.
+  // the plugin is not registered at all. Set CORS_ORIGINS when the dashboard is
+  // hosted separately from the engine — a CDN in front of a headless API.
   const origins = config.corsOrigins ?? [];
   if (origins.length > 0) {
     void app.register(cors, {
       origin: [...origins],
-      methods: ['GET', 'POST'],
-      credentials: true,
+      methods: ['GET', 'POST', 'OPTIONS'],
+      // Explicit rather than reflected: every route authenticates with a bearer
+      // token, so a preflight that does not permit Authorization would fail
+      // every cross-origin read while looking like a network fault.
+      allowedHeaders: ['Authorization', 'Content-Type'],
+      // The token travels in a header, not a cookie, so credentialed requests
+      // are not needed — and allowing them would widen what a hostile page
+      // could do with an existing session.
+      credentials: false,
+      maxAge: 86_400,
     });
   }
 

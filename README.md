@@ -126,16 +126,20 @@ Then open **http://localhost:8080** for the operator dashboard.
 
 ### Deploying
 
-The platform needs a host that runs a **long-lived process** — Fly.io, Render,
-Railway, a VPS. It cannot run on a serverless host: the tick loop, the held
-Postgres advisory lock and the websocket all need a process that survives
-between requests, and a serverless deploy fails silently by coming up healthy
-and never trading. `fly.toml`, `render.yaml` and `docker-compose.yml` are in the
-repo; see **[DEPLOYMENT.md](DEPLOYMENT.md)**.
+Both **interfaces** are static and deploy to any CDN — `npm run build:static`
+stages the backtest console and the trading dashboard into `public/`, and
+`vercel.json` wires it up with no secrets involved.
 
-The backtest console is separate and *is* static — `npm run build:static`
-produces a self-contained `public/index.html` that deploys to Vercel or any CDN.
-It holds no keys and cannot reach a broker.
+The **engine** needs a host that runs a long-lived process — Fly.io, Render,
+Railway, a VPS. It cannot run serverless, and not merely for want of a websocket:
+the square-off guard, the drawdown and daily-loss baselines, and staged
+approvals all live in memory, so an environment that forgets between
+invocations turns the kill switches silently inert. `fly.toml`, `render.yaml`
+and `docker-compose.yml` are in the repo.
+
+To run the dashboard from a CDN against a remote engine, set its **API URL**
+field and add that CDN origin to the engine's `CORS_ORIGINS`. See
+**[DEPLOYMENT.md](DEPLOYMENT.md)**.
 
 ### Locally
 
