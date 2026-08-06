@@ -347,6 +347,86 @@ describe('databaseOptionsFromEnv', () => {
     }
   });
 
+  it('promotes a follower once the leader releases', async () => {
+    // The rolling-deploy case: the new instance starts while the old still
+    // holds the lock. With a single attempt at startup it would stay read-only
+    // forever, so every deploy would end with a process that never trades.
+    const incumbent = new LeaderLock(pool);
+    const acquisitions: number[] = [];
+    const challenger = new LeaderLock(pool, {
+      retryIntervalMs: 50,
+      onAcquired: () => acquisitions.push(Date.now()),
+    });
+
+    try {
+      expect(await incumbent.tryAcquire()).toBe(true);
+      expect(await challenger.tryAcquire()).toBe(false);
+      expect(challenger.isLeader).toBe(false);
+
+      await incumbent.release();
+
+      // The retry timer, not another explicit call, is what promotes it.
+      for (let i = 0; i < 40 && !challenger.isLeader; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+
+      expect(challenger.isLeader).toBe(true);
+      expect(acquisitions).toHaveLength(1);
+    } finally {
+      await incumbent.release();
+      await challenger.release();
+    }
+  });
+
+  it('stops contending once released, so a shutting-down process cannot promote', async () => {
+    const incumbent = new LeaderLock(pool);
+    const leaving = new LeaderLock(pool, { retryIntervalMs: 50 });
+
+    try {
+      await incumbent.tryAcquire();
+      expect(await leaving.tryAcquire()).toBe(false);
+
+      // Shutdown, then the incumbent goes away.
+      await leaving.release();
+      await incumbent.release();
+
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      expect(leaving.isLeader).toBe(false);
+    } finally {
+      await incumbent.release();
+      await leaving.release();
+    }
+  });
+
+  it('fires onAcquired for a leader that wins immediately', async () => {
+    let acquired = 0;
+    const lock = new LeaderLock(pool, { onAcquired: () => (acquired += 1) });
+    try {
+      await lock.tryAcquire();
+      expect(acquired).toBe(1);
+    } finally {
+      await lock.release();
+    }
+  });
+
+  it('does not contend when retrying is disabled', async () => {
+    const incumbent = new LeaderLock(pool);
+    const passive = new LeaderLock(pool, { retryIntervalMs: 0 });
+
+    try {
+      await incumbent.tryAcquire();
+      expect(await passive.tryAcquire()).toBe(false);
+
+      await incumbent.release();
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      expect(passive.isLeader).toBe(false);
+    } finally {
+      await incumbent.release();
+      await passive.release();
+    }
+  });
+
   it('reports the lock as held under the key it actually took', async () => {
     const lock = new LeaderLock(pool);
     try {

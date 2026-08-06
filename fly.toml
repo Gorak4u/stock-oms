@@ -1,0 +1,72 @@
+# Fly.io deployment.
+#
+# Fly runs a persistent VM rather than a per-request function, which is what
+# this app needs: a tick loop, a held Postgres advisory lock, an ingestion
+# timer and a websocket all require a process that stays alive between
+# requests.
+#
+# Set the app name and region, then:
+#
+#   fly launch --no-deploy --copy-config
+#   fly postgres create --name stock-oms-db --region bom
+#   fly postgres attach stock-oms-db          # sets DATABASE_URL
+#   fly secrets set API_TOKEN=$(openssl rand -hex 24)
+#   fly deploy
+
+app = "stock-oms"
+primary_region = "bom"   # Mumbai — nearest to NSE; latency to the broker matters
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  NODE_ENV = "production"
+  # Paper by default. Reaching a live broker is a deliberate change:
+  #   fly secrets set BROKER=zerodha KITE_API_KEY=... KITE_API_SECRET=...
+  BROKER = "paper"
+  BAR_INTERVAL = "1m"
+  MARKET_DATA_SYNC_MS = "60000"
+
+# SIGTERM triggers the drain; the timeout is longer than SHUTDOWN_DRAIN_MS (30s)
+# so a tick in flight finishes rather than being killed between persisting an
+# order and hearing back from the broker.
+kill_signal = "SIGTERM"
+kill_timeout = "45s"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+
+  # The single most important setting here. Fly suspends idle machines by
+  # default, and a suspended machine runs no tick loop — the platform would
+  # stop trading whenever nobody happened to be loading the dashboard, and
+  # resume with no idea how much of the session it missed.
+  auto_stop_machines = false
+  auto_start_machines = false
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 200
+    hard_limit = 250
+
+# Fly routes on this; it returns 503 when a dependency is broken, and reports
+# stale market data as unhealthy during a session.
+[[http_service.checks]]
+  method = "GET"
+  path = "/health"
+  interval = "30s"
+  timeout = "5s"
+  grace_period = "30s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+# Run exactly one. A second machine comes up read-only by design — the advisory
+# lock makes it a follower — so extra machines cost money without trading.
+# During a deploy the new machine starts as a follower and promotes itself when
+# the old one releases the lock, so a rolling restart is safe.
+[deploy]
+  strategy = "rolling"

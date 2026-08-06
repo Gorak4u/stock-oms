@@ -112,6 +112,13 @@ jobs:
       - name: Build the browser console
         run: npm run build:console
 
+      # The static-site build is what a CDN host runs; breaking it would only
+      # surface as a failed deploy otherwise.
+      - name: Stage the static site
+        run: |
+          npm run build:static
+          test -s public/index.html
+
       # Guards the failure mode the asset copier exists to prevent: a container
       # that builds cleanly and then dies on its first migrate() call because
       # tsc does not copy .sql files into dist.

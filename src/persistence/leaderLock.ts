@@ -36,12 +36,25 @@ export interface LeaderLockOptions {
   readonly heartbeatMs?: number;
   /** Called when leadership is lost while running — the loop must stop. */
   readonly onLost?: (reason: string) => void;
+  /**
+   * How often a follower re-contends for the lock.
+   *
+   * Without this, every rolling deploy would end with a process that never
+   * trades: the new instance starts while the old still holds the lock, comes
+   * up read-only, and — with a single attempt at startup — stays read-only
+   * forever even after the old one exits. Set to 0 to disable retrying.
+   */
+  readonly retryIntervalMs?: number;
+  /** Called when leadership is taken, including on a later retry. */
+  readonly onAcquired?: () => void;
 }
 
 export class LeaderLock {
   private client: PoolClient | null = null;
   private heartbeat: NodeJS.Timeout | null = null;
+  private retry: NodeJS.Timeout | null = null;
   private held = false;
+  private stopped = false;
 
   constructor(
     private readonly pool: Pool,
@@ -56,34 +69,67 @@ export class LeaderLock {
    * Tries once to take leadership, without blocking.
    *
    * Non-blocking on purpose: a follower should come up, serve reads and say so,
-   * rather than hang at startup with no explanation.
+   * rather than hang at startup with no explanation. When it fails, a retry
+   * timer starts so the follower is promoted as soon as the incumbent leaves —
+   * which is what makes a rolling deploy work.
    */
   async tryAcquire(): Promise<boolean> {
     if (this.held) return true;
+    if (this.stopped) return false;
 
     const client = await this.pool.connect();
+
+    let locked = false;
     try {
       const { rows } = await client.query<{ locked: boolean }>(
         'SELECT pg_try_advisory_lock($1) AS locked',
         [TRADING_LEADER_KEY],
       );
-
-      if (!rows[0]?.locked) {
-        client.release();
-        return false;
-      }
-
-      // Held for the lifetime of this client, so it is never returned to the
-      // pool — releasing it would hand the lock-holding session to someone
-      // else, and the lock with it.
-      this.client = client;
-      this.held = true;
-      this.startHeartbeat();
-      return true;
+      locked = rows[0]?.locked === true;
     } catch (error) {
       client.release();
       throw error;
     }
+
+    if (!locked) {
+      client.release();
+      this.startRetry();
+      return false;
+    }
+
+    // Held for the lifetime of this client, so it is never returned to the
+    // pool — releasing it would hand the lock-holding session to someone
+    // else, and the lock with it.
+    this.client = client;
+    this.held = true;
+    this.stopRetry();
+    this.startHeartbeat();
+    this.options.onAcquired?.();
+    return true;
+  }
+
+  /**
+   * Polls for the lock while a follower.
+   *
+   * Deliberately quiet: a follower waiting for the incumbent to finish a deploy
+   * is the normal case, not an incident, so promotion is announced through
+   * `onAcquired` and failures to promote are not announced at all.
+   */
+  private startRetry(): void {
+    const interval = this.options.retryIntervalMs ?? 15_000;
+    if (interval <= 0 || this.retry || this.stopped) return;
+
+    this.retry = setInterval(() => {
+      void this.tryAcquire().catch(() => undefined);
+    }, interval);
+
+    // Never keep the process alive for a retry alone.
+    this.retry.unref?.();
+  }
+
+  private stopRetry(): void {
+    if (this.retry) clearInterval(this.retry);
+    this.retry = null;
   }
 
   /**
@@ -138,6 +184,11 @@ export class LeaderLock {
     this.client = null;
 
     this.options.onLost?.(reason);
+
+    // Contend again. Losing the lock is usually a dropped connection rather
+    // than a second instance genuinely taking over, so the same process is
+    // often the right leader once the database is reachable again.
+    this.startRetry();
   }
 
   private stopHeartbeat(): void {
@@ -145,9 +196,17 @@ export class LeaderLock {
     this.heartbeat = null;
   }
 
-  /** Releases leadership. Safe to call when not held. */
+  /**
+   * Releases leadership and stops contending. Safe to call when not held.
+   *
+   * Terminal: this is shutdown, so a follower must not quietly promote itself
+   * on a retry timer while the process is on its way out.
+   */
   async release(): Promise<void> {
+    this.stopped = true;
     this.stopHeartbeat();
+    this.stopRetry();
+
     if (!this.client) {
       this.held = false;
       return;

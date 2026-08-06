@@ -10,3 +10,6 @@ node_modules/
 
 # Redis dump, if a local server is started from the repo root
 dump.rdb
+
+# Static site staged by scripts/build-static.js
+public/

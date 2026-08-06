@@ -174,7 +174,10 @@ export async function main(): Promise<void> {
 
   // ---- leadership ----------------------------------------------------------
 
+  let promoted = false;
+
   const leader = new LeaderLock(database.pool, {
+    retryIntervalMs: optionalNumber('LEADER_RETRY_MS', 15_000),
     onLost: (reason) => {
       metrics.setGauge(METRICS.isLeader, 0);
       void alerts.dispatch({
@@ -184,13 +187,29 @@ export async function main(): Promise<void> {
         at: Date.now(),
       });
     },
+    onAcquired: () => {
+      metrics.setGauge(METRICS.isLeader, 1);
+      // Only announced when it happens *after* startup — being the leader from
+      // the beginning is the ordinary case and needs no alert.
+      if (!promoted) return;
+      log('info', 'promoted to leader — this process is now trading');
+      void alerts.dispatch({
+        severity: 'info',
+        title: 'Promoted to trading leader',
+        detail: 'The previous leader released the lock; this process has taken over.',
+        at: Date.now(),
+      });
+    },
   });
 
   const isLeader = await leader.tryAcquire();
   metrics.setGauge(METRICS.isLeader, isLeader ? 1 : 0);
+  promoted = true;
 
   if (!isLeader) {
-    log('warn', 'another instance holds the trading lock — starting read-only');
+    log('warn', 'another instance holds the trading lock — starting read-only', {
+      note: 'will take over automatically when the current leader exits',
+    });
   }
 
   // Rebuild and reconcile before anything can trade.

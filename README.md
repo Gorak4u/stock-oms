@@ -124,6 +124,19 @@ docker compose up --build
 
 Then open **http://localhost:8080** for the operator dashboard.
 
+### Deploying
+
+The platform needs a host that runs a **long-lived process** — Fly.io, Render,
+Railway, a VPS. It cannot run on a serverless host: the tick loop, the held
+Postgres advisory lock and the websocket all need a process that survives
+between requests, and a serverless deploy fails silently by coming up healthy
+and never trading. `fly.toml`, `render.yaml` and `docker-compose.yml` are in the
+repo; see **[DEPLOYMENT.md](DEPLOYMENT.md)**.
+
+The backtest console is separate and *is* static — `npm run build:static`
+produces a self-contained `public/index.html` that deploys to Vercel or any CDN.
+It holds no keys and cannot reach a broker.
+
 ### Locally
 
 ```bash

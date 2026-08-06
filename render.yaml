@@ -1,0 +1,91 @@
+# Render Blueprint.
+#
+# Provisions the web service, Postgres and Redis together. Render runs the
+# container as a persistent process, which is what the tick loop, the held
+# advisory lock and the websocket all require.
+#
+# Deploy: push this file, then New → Blueprint in the Render dashboard.
+#
+# Plan names change from time to time; if a deploy is rejected for an unknown
+# plan, substitute whatever the dashboard currently offers. Nothing else here
+# depends on the tier.
+
+services:
+  - type: web
+    name: stock-oms
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    region: singapore # closest Render region to NSE
+    # Exactly one. A second instance comes up read-only by design (the advisory
+    # lock makes it a follower), so scaling out costs money without trading.
+    numInstances: 1
+    healthCheckPath: /health
+
+    envVars:
+      # Generated once and stored by Render. Read it from the dashboard — every
+      # API route needs it as a bearer token.
+      - key: API_TOKEN
+        generateValue: true
+
+      - key: DATABASE_URL
+        fromDatabase:
+          name: stock-oms-db
+          property: connectionString
+
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: stock-oms-redis
+          property: connectionString
+
+      # Managed Postgres terminates TLS with its own CA, so verification is
+      # relaxed but the link is still encrypted — positions and order flow do
+      # not cross the network in clear text.
+      - key: PGSSLMODE
+        value: require
+
+      # Paper broker by default. Switch to zerodha in the dashboard, and add
+      # KITE_API_KEY / KITE_API_SECRET as secrets, when you actually mean it.
+      - key: BROKER
+        value: paper
+
+      - key: BAR_INTERVAL
+        value: 1m
+      - key: MARKET_DATA_SYNC_MS
+        value: '60000'
+      - key: OPENING_CASH
+        value: '1000000'
+      - key: STRATEGY
+        value: trend
+
+      # Comma-separated watchlist. Empty means the loop has nothing to trade,
+      # which is the right default until history has been backfilled.
+      - key: SYMBOLS
+        sync: false
+
+      # Reads require the API token unless this is true. Leave it false unless
+      # something in front is authenticating — it publishes positions, the
+      # equity curve and the audit log.
+      - key: API_PUBLIC_READS
+        value: 'false'
+
+      # Set to a Slack/PagerDuty-style webhook to enable durable alert delivery.
+      - key: ALERT_WEBHOOK_URL
+        sync: false
+
+  - type: redis
+    name: stock-oms-redis
+    plan: starter
+    region: singapore
+    # Reachable only from services in this Blueprint.
+    ipAllowList: []
+    # The queue holds undelivered alerts; losing them on eviction would lose
+    # exactly the alerts raised while something was already going wrong.
+    maxmemoryPolicy: noeviction
+
+databases:
+  - name: stock-oms-db
+    plan: basic-256mb
+    region: singapore
+    postgresMajorVersion: '16'
