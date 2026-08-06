@@ -142,6 +142,24 @@ function contractSuite(name: string, setup: () => Promise<Repositories>, teardow
         expect(await repos.orders.findByIdempotencyKey('missing')).toBeNull();
       });
 
+      it('finds by broker order id', async () => {
+        // The bridge every incoming fill crosses: brokers report against their
+        // own identifiers, the platform stores its own.
+        await repos.orders.insert(order({ id: 'ours', brokerOrderId: 'paper-42' }, 'k-broker'));
+
+        const found = await repos.orders.findByBrokerOrderId('paper-42');
+        expect(found!.id).toBe('ours');
+        expect(await repos.orders.findByBrokerOrderId('paper-999')).toBeNull();
+      });
+
+      it('does not match an order that has no broker id yet', async () => {
+        // A PENDING_NEW order has been persisted but not acknowledged, so it
+        // has no broker id. Matching it to one would attribute a fill to the
+        // wrong order.
+        await repos.orders.insert(order({ id: 'pending', status: 'PENDING_NEW' }, 'k-pending'));
+        expect(await repos.orders.findByBrokerOrderId('pending')).toBeNull();
+      });
+
       it('lists only non-terminal orders as open', async () => {
         await repos.orders.insert(order({ id: 'a', status: 'OPEN' }, 'a'));
         await repos.orders.insert(order({ id: 'b', status: 'PENDING_NEW' }, 'b'));
@@ -191,6 +209,23 @@ function contractSuite(name: string, setup: () => Promise<Repositories>, teardow
         await repos.fills.append(fill());
         expect(await repos.fills.append(fill())).toBe(false);
         expect(await repos.fills.forOrder('ord-key-1')).toHaveLength(1);
+      });
+
+      it('round-trips the broker reference', async () => {
+        await repos.fills.append(fill({ brokerOrderId: 'paper-42' }));
+        const [stored] = await repos.fills.forOrder('ord-key-1');
+        expect(stored?.brokerOrderId).toBe('paper-42');
+      });
+
+      it('stores a fill for an order it has never seen', async () => {
+        // A foreign key here rejected every broker-sourced fill, and startup
+        // rebuilds the portfolio by replaying stored fills — so a fill that
+        // cannot be stored is a position that vanishes on the next restart
+        // while still existing at the broker.
+        expect(
+          await repos.fills.append(fill({ orderId: 'never-heard-of-it' })),
+        ).toBe(true);
+        expect(await repos.fills.forOrder('never-heard-of-it')).toHaveLength(1);
       });
 
       it('treats a genuinely different fill on the same order as new', async () => {

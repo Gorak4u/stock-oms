@@ -112,6 +112,13 @@ API is token-authenticated, but it should not also be the TLS terminator.
 1. **Load history.** The `candle` table starts empty and an empty table means a
    loop that ticks quietly forever without trading. See
    [Loading market data](README.md#loading-market-data).
+
+   To confirm the deployment works before you have real data, seed it:
+   `npm run seed -- --reset` against the deployed `DATABASE_URL` fills every
+   screen by driving the real pipeline. Clear it again with `--reset` before
+   loading actual history — the seed refuses to mix synthetic bars into a
+   database that already holds candles, because afterwards there is no way to
+   tell the two apart.
 2. **Check `/health`.** The `market-data` check reports stale or absent data as
    unhealthy during a session — it is the one that catches an inert system.
 3. **Leave `BROKER=paper`** until a backtest and walk-forward on real history

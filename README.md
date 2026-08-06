@@ -156,6 +156,27 @@ testable on a bare machine. CI sets `REQUIRE_INFRA=1`, which turns those skips
 into failures — a green build that silently ran neither adapter suite is worse
 than a red one.
 
+### Trying it end to end
+
+A fresh install has an empty `candle` table, which means an empty dashboard and
+a loop with nothing to decide on. That is correct and completely uninformative —
+you cannot tell a working system from a broken one when both show zero.
+
+```bash
+npm run seed -- --reset      # synthetic data, ~400 trading days, 3 symbols
+npm start                    # then open http://localhost:8080
+```
+
+The seed does not insert rows into `order` and `trade`. It drives the real
+pipeline — signal → risk → sizing → OMS → paper broker → fill → portfolio →
+persistence → audit — one bar at a time, so what you end up looking at was
+produced by the code that would run against a live broker. It leaves the system
+in `MANUAL`, and refuses to run against a database that already holds candles
+unless you pass `--reset`.
+
+The data is synthetic. It demonstrates that the pipeline carries a decision from
+bar to fill to ledger; it says nothing about whether any strategy makes money.
+
 ### Loading market data
 
 Nothing decides anything until the `candle` table has bars in it. The live loop

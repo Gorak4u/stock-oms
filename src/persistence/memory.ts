@@ -55,6 +55,13 @@ export class MemoryOrderRepository implements OrderRepository {
     return id ? (this.byId.get(id) ?? null) : null;
   }
 
+  async findByBrokerOrderId(brokerOrderId: string): Promise<Order | null> {
+    for (const order of this.byId.values()) {
+      if (order.brokerOrderId === brokerOrderId) return order;
+    }
+    return null;
+  }
+
   async findOpen(): Promise<Order[]> {
     return [...this.byId.values()]
       .filter((o) => !['FILLED', 'CANCELLED', 'REJECTED'].includes(o.status))

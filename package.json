@@ -12,6 +12,7 @@
     "test:watch": "jest --watch",
     "backtest": "ts-node scripts/run-backtest.ts",
     "backfill": "ts-node scripts/backfill.ts",
+    "seed": "ts-node scripts/seed.ts",
     "build": "tsc -p tsconfig.build.json && node scripts/copy-assets.js && node scripts/build-console.js",
     "build:console": "node scripts/build-console.js",
     "build:static": "node scripts/build-static.js",

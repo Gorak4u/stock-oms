@@ -123,7 +123,15 @@ export class Reconciler {
       });
     }
 
-    for (const fill of brokerFills) {
+    for (const brokerFill of brokerFills) {
+      // Broker fills carry the broker's order id. Resolve it to the platform's
+      // before storing, or the fill is attributed to nothing and — while the
+      // fill table still had a foreign key — could not be stored at all.
+      const matched = await this.config.orders.findByBrokerOrderId(brokerFill.orderId);
+      const fill: Fill = matched
+        ? { ...brokerFill, orderId: matched.id, brokerOrderId: brokerFill.orderId }
+        : { ...brokerFill, brokerOrderId: brokerFill.orderId };
+
       const stored = await this.config.fills.append(fill);
       if (!stored) continue;
 

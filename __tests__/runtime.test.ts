@@ -211,6 +211,117 @@ function dailyBars(count: number, seed = 7): Candle[] {
   return out;
 }
 
+describe('state survives a restart', () => {
+  /**
+   * The invariant tradingService.ts opens by claiming: replaying fills means a
+   * restart lands on exactly the state the process had before it died.
+   *
+   * The bug this pins: positions were persisted only when a fill changed them,
+   * so `last_price` stayed at the entry price while the live portfolio was
+   * marked to each new bar. A restart rebuilt the account at entry prices, and
+   * because the drawdown and daily-loss limits measure against equity, it moved
+   * the baseline those kill switches use.
+   */
+  it('rebuilds the same equity after a restart with an open position', async () => {
+    const repositories = memoryRepositories();
+
+    const build = () =>
+      new TradingService({
+        repositories,
+        broker: new PaperBroker({ costSchedule: ZERO_COST_SCHEDULE, slippageFraction: 0 }),
+        openingCash: fromRupees(1_000_000),
+        calendar,
+        symbols: ['NSE:TEST'],
+      });
+
+    const first = build();
+    await first.start();
+
+    // Buy, fill at 100, then mark the position up to 130.
+    const entry = fromIst('2026-03-02', 10 * 60);
+    await first.applyFill({
+      orderId: 'ord-1', symbol: 'NSE:TEST', side: 'BUY', quantity: 100,
+      price: fromRupees(100), timestamp: entry, commission: 0 as Paise,
+    });
+
+    first.portfolio.mark('NSE:TEST', fromRupees(130));
+    await first.snapshot(entry + 60_000);
+
+    const before = first.status().equity;
+    expect(first.portfolio.getPosition('NSE:TEST')?.unrealisedPnl).toBe(fromRupees(3_000));
+
+    // A different process, same database.
+    const second = build();
+    await second.start();
+
+    expect(second.status().equity).toBe(before);
+    expect(second.portfolio.getPosition('NSE:TEST')?.lastPrice).toBe(fromRupees(130));
+  });
+});
+
+describe('fills from a broker', () => {
+  /**
+   * Brokers report fills against their own order ids. Nothing bridged that to
+   * the platform's, so a fill was attributed to no order — and against Postgres
+   * the foreign key rejected it outright, losing money that had already moved.
+   */
+  it('attributes a fill carrying the broker order id to the platform order', async () => {
+    const { svc, repositories } = service();
+    await svc.start();
+
+    await repositories.orders.insert({
+      id: 'platform-order-1',
+      request: {
+        symbol: 'NSE:TEST', side: 'BUY', quantity: 10, orderType: 'MARKET',
+        product: 'MIS', timeInForce: 'DAY', strategyId: 'test',
+        idempotencyKey: 'key-1',
+      },
+      status: 'OPEN',
+      brokerOrderId: 'paper-7',
+      filledQuantity: 0,
+      createdAt: 1000,
+      updatedAt: 1000,
+    });
+
+    await svc.applyFill({
+      orderId: 'paper-7', // the broker's id, not ours
+      symbol: 'NSE:TEST', side: 'BUY', quantity: 10,
+      price: fromRupees(100), timestamp: 2000, commission: 0 as Paise,
+    });
+
+    const [stored] = await repositories.fills.since(0);
+    expect(stored?.orderId).toBe('platform-order-1');
+    expect(stored?.brokerOrderId).toBe('paper-7');
+    expect(svc.portfolio.getPosition('NSE:TEST')?.quantity).toBe(10);
+
+    // A break is still recorded, and correctly: the order was inserted straight
+    // into the repository, so the in-memory OMS has never seen it — the same
+    // situation as an order placed before a restart. The break says the order's
+    // *state* could not be updated, which is true. What matters here is that
+    // the fill was attributed to the right order rather than orphaned.
+    const breaks = await repositories.reconciliation.open();
+    expect(breaks).toHaveLength(1);
+    expect(breaks[0]?.orderId).toBe('platform-order-1');
+  });
+
+  it('still stores a fill whose order is unknown', async () => {
+    const { svc, repositories } = service();
+    await svc.start();
+
+    await svc.applyFill({
+      orderId: 'broker-mystery', symbol: 'NSE:TEST', side: 'BUY', quantity: 5,
+      price: fromRupees(100), timestamp: 2000, commission: 0 as Paise,
+    });
+
+    // Money that moved is recorded even when it cannot be attributed —
+    // dropping it would leave the platform trading against a position it does
+    // not know it has.
+    expect(await repositories.fills.since(0)).toHaveLength(1);
+    expect(svc.portfolio.getPosition('NSE:TEST')?.quantity).toBe(5);
+    expect(await repositories.reconciliation.open()).toHaveLength(1);
+  });
+});
+
 describe('buildDataset', () => {
   it('drops the final horizon bars, whose outcome has not happened yet', () => {
     const candles = dailyBars(400);

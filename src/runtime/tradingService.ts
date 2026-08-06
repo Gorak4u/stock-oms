@@ -221,8 +221,35 @@ export class TradingService {
     return outcome;
   }
 
+  /**
+   * Translates a broker's order id into the platform's.
+   *
+   * Brokers report fills against their own identifiers — Kite's `order_id`,
+   * the paper broker's `paper-N` — and the platform stores its own. Without
+   * this bridge a fill is attributed to nothing, the OMS cannot mark its order
+   * filled, and every fill looks like an unknown-order reconciliation break.
+   *
+   * The in-memory OMS is asked first because it is free and covers everything
+   * placed since startup; the database covers orders placed before a restart.
+   * When neither knows the id, the fill is kept under it unchanged — a fill is
+   * money that moved, and losing it is far worse than filing it imperfectly.
+   */
+  private async resolveFill(fill: Fill): Promise<Fill> {
+    if (this.oms.getOrder(fill.orderId)) return fill;
+
+    const known = await this.repositories.orders.findById(fill.orderId);
+    if (known) return fill;
+
+    const byBroker = await this.repositories.orders.findByBrokerOrderId(fill.orderId);
+    if (!byBroker) return { ...fill, brokerOrderId: fill.orderId };
+
+    return { ...fill, orderId: byBroker.id, brokerOrderId: fill.orderId };
+  }
+
   /** Applies a fill from the broker, updating orders, positions and P&L. */
-  async applyFill(fill: Fill): Promise<ClosedTrade | null> {
+  async applyFill(incoming: Fill): Promise<ClosedTrade | null> {
+    const fill = await this.resolveFill(incoming);
+
     const isNew = await this.repositories.fills.append(fill);
     if (!isNew) return null; // already folded in — replay is a no-op
 
@@ -272,6 +299,22 @@ export class TradingService {
   /** Writes an equity point and refreshes the gauges. */
   async snapshot(at: Timestamp): Promise<void> {
     const snapshot = this.portfolio.snapshot();
+
+    // Persist the marks, not just the equity they produce.
+    //
+    // Positions were previously written only when a fill changed them, so
+    // `last_price` stayed at the entry price while the in-memory portfolio was
+    // marked to each new bar. Startup rebuilds by replaying fills and then
+    // marking from these rows, so a restart with open positions resurrected the
+    // account at its entry prices — breaking the invariant this file opens by
+    // claiming, that the equity curve after a restart matches the one before.
+    //
+    // Not merely cosmetic: the drawdown and daily-loss limits are evaluated
+    // against account equity, so a restart moved the baseline those kill
+    // switches measure from.
+    for (const position of snapshot.positions) {
+      await this.repositories.positions.upsert(position, at);
+    }
 
     await this.repositories.equity.append({
       timestamp: at,

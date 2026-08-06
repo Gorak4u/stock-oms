@@ -126,7 +126,19 @@ export interface Order {
 }
 
 export interface Fill {
+  /**
+   * The order this fill belongs to.
+   *
+   * A broker reports fills against its *own* order id, which is not the
+   * platform's. Fills are resolved at the boundary — see
+   * `TradingService.applyFill` — so by the time one is stored this holds the
+   * platform order id whenever that order is known, and the broker's id when it
+   * is not. Either way it is stable, which is what makes replaying a fill a
+   * no-op rather than a double count.
+   */
   readonly orderId: string;
+  /** The broker's own reference, kept so a fill can be traced back to the venue. */
+  readonly brokerOrderId?: string;
   readonly symbol: string;
   readonly side: Side;
   readonly quantity: number;

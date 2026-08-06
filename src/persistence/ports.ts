@@ -32,6 +32,14 @@ export interface OrderRepository {
   update(order: Order): Promise<void>;
   findById(id: string): Promise<Order | null>;
   findByIdempotencyKey(key: string): Promise<Order | null>;
+  /**
+   * Resolves a broker's own order id to the platform's order.
+   *
+   * Needed on every incoming fill: brokers report against their identifiers,
+   * the platform stores its own, and something has to bridge the two before a
+   * fill can be attributed.
+   */
+  findByBrokerOrderId(brokerOrderId: string): Promise<Order | null>;
   /** Orders not in a terminal state — what reconciliation and recovery work on. */
   findOpen(): Promise<Order[]>;
   findRecent(limit: number): Promise<Order[]>;

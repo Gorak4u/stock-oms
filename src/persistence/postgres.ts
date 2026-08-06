@@ -324,6 +324,16 @@ export class PgOrderRepository implements OrderRepository {
     return rows[0] ? rowToOrder(rows[0]) : null;
   }
 
+  async findByBrokerOrderId(brokerOrderId: string): Promise<Order | null> {
+    const { rows } = await this.pool.query<OrderRow>(
+      // Newest first: a broker id should be unique, but if one were ever
+      // reused the current order is the right answer.
+      'SELECT * FROM trading."order" WHERE broker_order_id = $1 ORDER BY created_at DESC LIMIT 1',
+      [brokerOrderId],
+    );
+    return rows[0] ? rowToOrder(rows[0]) : null;
+  }
+
   async findOpen(): Promise<Order[]> {
     const { rows } = await this.pool.query<OrderRow>(
       `SELECT * FROM trading."order"
@@ -354,19 +364,24 @@ export class PgFillRepository implements FillRepository {
    */
   async append(fill: Fill): Promise<boolean> {
     const { rowCount } = await this.pool.query(
-      `INSERT INTO trading.fill (order_id, symbol, side, quantity, price, commission, ts)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)
+      `INSERT INTO trading.fill
+         (order_id, broker_order_id, symbol, side, quantity, price, commission, ts)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
        ON CONFLICT (order_id, ts, quantity, price) DO NOTHING`,
-      [fill.orderId, fill.symbol, fill.side, fill.quantity, fill.price, fill.commission, fill.timestamp],
+      [
+        fill.orderId, fill.brokerOrderId ?? null, fill.symbol, fill.side,
+        fill.quantity, fill.price, fill.commission, fill.timestamp,
+      ],
     );
     return (rowCount ?? 0) > 0;
   }
 
   private map(row: {
-    order_id: string; symbol: string; side: Side; quantity: number;
-    price: string; commission: string; ts: string;
+    order_id: string; broker_order_id: string | null; symbol: string; side: Side;
+    quantity: number; price: string; commission: string; ts: string;
   }): Fill {
     return {
+      ...(row.broker_order_id ? { brokerOrderId: row.broker_order_id } : {}),
       orderId: row.order_id,
       symbol: row.symbol,
       side: row.side,
