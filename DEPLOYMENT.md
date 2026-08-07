@@ -1,6 +1,24 @@
 # Deployment
 
-**This is one application.** One build, one process, one URL:
+**This is one application.** Two ways to run it, and both serve everything from
+one URL:
+
+| | Always-on process | Vercel |
+| --- | --- | --- |
+| Runs on | Fly.io, Render, Railway, a VPS | Vercel, one deploy |
+| Tick | its own `setInterval` | Vercel Cron calling `/api/tick` |
+| Single-writer guard | Postgres advisory lock | a lease row with an expiry |
+| Live status | websocket, plus 10s polling | 10s polling |
+| Paper broker | works | **cannot fill** — see below |
+| Tick reliability | as reliable as the process | best-effort cron delivery |
+
+Vercel is the simpler operation and genuinely works, with real constraints
+listed under [Vercel](#vercel). An always-on process is the stronger foundation.
+Pick by what you are doing, not by which sounds more serious.
+
+## The always-on process
+
+One build, one process, one URL:
 
 | Route | What |
 | --- | --- |
@@ -25,48 +43,43 @@ Node 20+, **Postgres 16**, and optionally Redis (for durable alert delivery).
 Run **exactly one instance** — a second comes up read-only by design, so it
 costs money without trading.
 
-It cannot run on a serverless host. Not a config problem, and not merely the
-websocket: see [why](#why-the-engine-cannot-run-serverless) below.
+For the Vercel path instead, see [Vercel](#vercel).
 
-## Why the engine cannot run serverless
+## What had to change to run per-invocation
 
-This is not a configuration problem. Vercel, Netlify Functions, Cloudflare
-Workers and Lambda all execute per request and freeze or discard the process in
-between. The engine depends on the opposite — and the parts that break are the
-ones that protect capital.
+This is recorded because the reasoning matters more than the outcome: for most
+of this project's life, deploying to a serverless host would have produced a
+system that looked healthy and had no working risk controls.
 
-**Risk state lives in memory and would reset on every invocation:**
+Four pieces of state lived only in memory, and none of them derive from
+anything, so replaying fills could not rebuild them:
 
-| State | Where | What breaks when it resets |
-| --- | --- | --- |
-| `squaredOffOn` | `runner.ts` | Square-off re-fires every tick for the last 20 minutes — roughly 20 duplicate market exit orders per position |
-| `peakEquity`, `startOfDayEquity` | `tradingPipeline.ts` | Drawdown and daily-loss baselines reset to current equity, so **those kill switches never trigger** |
-| `approvals` | `tradingPipeline.ts` | Staged orders vanish before anyone can approve them |
-| Loss-streak breaker | `tradingPipeline.ts` | The circuit breaker never trips |
+| State | What broke when it reset |
+| --- | --- |
+| `peakEquity`, `startOfDayEquity` | Drawdown and daily-loss baselines reset to current equity, so **those kill switches never triggered** |
+| Loss-streak breaker | The circuit breaker never tripped |
+| `squaredOffOn` | Square-off re-fired every tick for the last twenty minutes — roughly twenty duplicate exit orders per position |
+| Staged approvals | Orders vanished before anyone could approve them |
 
-**And the mechanics do not survive either:**
+All four are now snapshotted and restored, which fixed a live bug in the
+always-on deployment too: a restart there had exactly the same effect. That is
+the change that made a per-invocation tick viable at all. The advisory lock was
+then replaced by a lease for the same job, since there is no long-lived
+connection for a lock to live on.
 
-- **The trading loop is a `setInterval`.** No requests means no ticks, so it
-  would never trade — while looking perfectly healthy.
-- **Leader election holds a Postgres advisory lock on a persistent session.**
-  A new connection per invocation drops the lock constantly, and concurrent
-  invocations produce the simultaneous writers the lock exists to prevent.
-- **`/ws` is a long-lived websocket server.** Serverless cannot host one.
-- **Market data ingestion and alert delivery are interval workers.**
-- **The SIGTERM drain** — which stops the process exiting between persisting an
-  order and hearing back from the broker — has nothing to hook into.
-- **The pool opens up to 10 connections per instance**, which across many
-  concurrent function instances exhausts Postgres.
+**What is still weaker, and always will be:**
 
-Deploying it to a serverless host does not error. It comes up, serves the
-dashboard, reports healthy, never places a trade — and if you did make it tick,
-the loss limits would be silently inert. That is why the split above is worth
-being strict about.
+- Cron delivery is best-effort, where a `setInterval` in a live process is not.
+- The lease is bounded by a clock, where the advisory lock is released by the
+  database noticing a dead connection. A stalled-but-alive invocation can
+  overlap the next one; idempotency keys sit underneath, but the guarantee is
+  softer.
+- The paper broker cannot fill, because its state is in memory.
+- Every cold start pays to rebuild state and replay the fill history.
 
-Making it serverless-safe is possible, but it means moving every row of that
-first table into Postgres and driving ticks from cron. That is a rewrite of the
-code that protects capital, in exchange for saving a few dollars a month on a
-small always-on instance.
+None of that makes the Vercel path wrong. It makes it the right tool for a
+dashboard, a console, daily bars and paper-money experimentation, and the wrong
+one for minute bars against real capital.
 
 ## Hosts
 
@@ -132,6 +145,76 @@ usually within `LEADER_RETRY_MS` (15s default). The old instance drains a tick
 in flight before exiting, so give the orchestrator at least 45 seconds before it
 resorts to SIGKILL. `docker-compose.yml` sets `stop_grace_period: 45s` and
 `fly.toml` sets `kill_timeout = "45s"` for this reason.
+
+## Vercel
+
+One deploy serves the dashboard, the console, the API and the scheduled tick.
+`vercel.json` is already wired up.
+
+```bash
+vercel link
+vercel env add DATABASE_URL      # a serverless Postgres: Vercel Postgres, Neon, Supabase
+vercel env add API_TOKEN         # openssl rand -hex 24
+vercel env add CRON_SECRET       # openssl rand -hex 24
+vercel deploy --prod
+```
+
+Then `/` is the dashboard, `/console` the backtest console, `/api/*` the API.
+Paste the API token into the dashboard; leave its **API URL** field blank, since
+everything is same-origin.
+
+### How it runs
+
+`api/index.ts` hands every request to the same Fastify app the always-on process
+builds — there is no second implementation of any route. The application is
+rebuilt from the database per cold start and cached while the container stays
+warm.
+
+Vercel Cron calls `POST /api/tick` on a schedule. Each tick ingests, then runs
+one iteration of the same loop, under a lease so two overlapping deliveries
+cannot both decide. The default schedule is `*/5 3-10 * * 1-5` — every five
+minutes through the NSE session, **in UTC**, which is 09:15–15:30 IST.
+
+This works at all only because the pipeline's risk state and the square-off
+guard are persisted. Before that, a per-invocation deployment reset the drawdown
+peak on every tick and left the daily-loss and drawdown kill switches
+permanently inert, while every dashboard showed green.
+
+### What you must check before trusting it
+
+- **Paper trading does not work here.** The paper broker keeps its resting
+  orders, cash and fills in memory, so it is rebuilt on every invocation and a
+  submitted order is gone before it can fill. Seeded history displays correctly
+  and the console works fully, but no *new* order will ever fill. `/health`
+  reports the broker as degraded rather than pretending otherwise. Use
+  `BROKER=zerodha`, whose state lives at the broker, or run the always-on
+  process for paper trading.
+- **Cron frequency depends on your Vercel plan.** Sub-daily schedules are a paid
+  feature; on the free tier a cron fires once a day, which supports daily-bar
+  strategies and nothing faster. Check your plan before assuming five-minute
+  ticks.
+- **Cron delivery is best-effort.** A missed tick during a fast move is a missed
+  stop-loss. The `tick` health check reports when ticks stop arriving, which is
+  the failure a scheduled loop has and a self-scheduled one does not.
+- **Use a Postgres built for serverless.** Vercel Postgres, Neon or Supabase
+  pool connections; a plain instance will exhaust its connection limit as
+  invocations scale.
+- **Function duration is capped.** A tick over many symbols must finish inside
+  it. `maxDuration` in `vercel.json` is set to 60s; the ceiling depends on plan.
+
+### Verifying a deploy
+
+```bash
+curl https://your-app.vercel.app/health
+curl -H "Authorization: Bearer $API_TOKEN" https://your-app.vercel.app/api/status
+curl -X POST -H "Authorization: Bearer $API_TOKEN" https://your-app.vercel.app/api/tick
+```
+
+The tick returns `{"ran":true,...}`, or `{"ran":false,"reason":"another
+invocation holds the tick lease"}` — which is the guard working, not an error.
+
+To fill the dashboard before you have real history, point `DATABASE_URL` at the
+deployed database and run `npm run seed -- --reset` locally.
 
 ## Optional: the pages on a CDN as well
 

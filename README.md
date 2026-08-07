@@ -126,15 +126,20 @@ Then open **http://localhost:8080** for the operator dashboard.
 
 ### Deploying
 
-One application, one deploy. The process serves the dashboard at `/`, the
-backtest console at `/console`, the API at `/api/*` and the live stream at
-`/ws`. Deploy it to anything that runs a container — `fly.toml`, `render.yaml`
-and `docker-compose.yml` are in the repo.
+One application, one deploy, serving the dashboard at `/`, the backtest console
+at `/console`, and the API at `/api/*`. Two ways to run it:
 
-It cannot run on a serverless host, and not merely for want of a websocket: the
-square-off guard, the drawdown and daily-loss baselines and staged approvals all
-live in memory, so an environment that forgets between invocations turns the
-kill switches silently inert.
+- **An always-on process** — Fly.io, Render, Railway, a VPS. Schedules its own
+  loop, holds a Postgres advisory lock, streams over a websocket. The stronger
+  foundation. `fly.toml`, `render.yaml` and `docker-compose.yml` are in the repo.
+- **Vercel** — one deploy, with the tick driven by Vercel Cron and the
+  single-writer guard expressed as a lease. Simpler to operate, with real
+  constraints: cron delivery is best-effort, and the in-memory paper broker
+  cannot fill, so live trading needs `BROKER=zerodha`. `vercel.json` is wired up.
+
+This works only because the pipeline's risk state and the square-off guard are
+persisted rather than held in memory — which was also a live bug in the
+always-on deployment, where a restart reset the drawdown baseline.
 
 See **[DEPLOYMENT.md](DEPLOYMENT.md)**.
 

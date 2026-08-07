@@ -59,6 +59,22 @@ export interface ApiConfig {
   readonly onBrokerSession?: (input: {
     requestToken?: string; accessToken?: string; actor: string;
   }) => Promise<{ expiresAt: number | null }>;
+  /**
+   * Runs one iteration of the trading loop.
+   *
+   * Present when an external scheduler drives the loop instead of the process
+   * scheduling it itself — a serverless deployment, where there is no
+   * `setInterval` to own it. Absent on the always-on process, where the runner
+   * owns its own timer and an HTTP-triggered tick would race it.
+   */
+  readonly onTick?: () => Promise<unknown>;
+  /**
+   * Shared secret the scheduler presents, in addition to the API token.
+   *
+   * Vercel signs cron requests with `CRON_SECRET`; accepting the API token too
+   * lets an operator force a tick by hand while debugging.
+   */
+  readonly cronSecret?: string;
 }
 
 /** Constant-time comparison; a plain `===` on a secret leaks its length by timing. */
@@ -386,6 +402,37 @@ export function buildServer(config: ApiConfig): FastifyInstance {
   app.get('/api/reconciliation', async () => ({
     breaks: await repositories.reconciliation.open(),
   }));
+
+  // ---- scheduled tick ----------------------------------------------------
+
+  /**
+   * Runs one iteration of the trading loop.
+   *
+   * Only mounted when something external drives the loop. It places orders, so
+   * it authenticates against the scheduler's secret or the API token — never
+   * on the strength of the request merely arriving.
+   */
+  if (config.onTick) {
+    const runTick = config.onTick;
+
+    app.post('/api/tick', async (request, reply) => {
+      const token = bearerOf(request);
+      const permitted =
+        (config.cronSecret !== undefined && token !== '' && tokensMatch(token, config.cronSecret)) ||
+        (token !== '' && tokensMatch(token, config.authToken));
+
+      if (!permitted) return reply.code(401).send({ error: 'unauthorised' });
+
+      try {
+        return await runTick();
+      } catch (error) {
+        return reply.code(500).send({
+          ran: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    });
+  }
 
   // ---- broker session ----------------------------------------------------
 

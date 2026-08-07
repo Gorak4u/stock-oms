@@ -22,7 +22,7 @@ const file = path.join(__dirname, '..', 'vercel.json');
 const TOP_LEVEL = new Set([
   '$schema', 'framework', 'installCommand', 'buildCommand', 'outputDirectory',
   'github', 'headers', 'redirects', 'rewrites', 'cleanUrls', 'trailingSlash',
-  'regions', 'crons', 'ignoreCommand', 'devCommand',
+  'regions', 'crons', 'functions', 'ignoreCommand', 'devCommand',
 ]);
 
 /** A header *route*. */
@@ -71,6 +71,43 @@ routes.forEach((route, i) => {
     }
   });
 });
+
+const REWRITE = new Set(['source', 'destination', 'has', 'missing']);
+const CRON = new Set(['path', 'schedule']);
+
+(Array.isArray(config.rewrites) ? config.rewrites : []).forEach((rewrite, i) => {
+  check(rewrite, REWRITE, `rewrites[${i}]`);
+  if (typeof rewrite.source !== 'string' || typeof rewrite.destination !== 'string') {
+    errors.push(`rewrites[${i}] needs string "source" and "destination"`);
+  }
+});
+
+(Array.isArray(config.crons) ? config.crons : []).forEach((cron, i) => {
+  check(cron, CRON, `crons[${i}]`);
+
+  if (typeof cron.path !== 'string' || !cron.path.startsWith('/')) {
+    errors.push(`crons[${i}].path must be an absolute path`);
+  }
+  // Five fields, like any cron. Vercel evaluates them in UTC, which is the
+  // detail most likely to be got wrong for an exchange in another timezone.
+  if (typeof cron.schedule !== 'string' || cron.schedule.trim().split(/\s+/).length !== 5) {
+    errors.push(`crons[${i}].schedule must be a 5-field cron expression`);
+  }
+});
+
+// A cron path that nothing serves fires into a 404 on a schedule, silently.
+for (const cron of Array.isArray(config.crons) ? config.crons : []) {
+  if (typeof cron.path !== 'string') continue;
+
+  const served =
+    fs.existsSync(path.join(__dirname, '..', `${cron.path.replace(/^\//, '')}.ts`)) ||
+    (Array.isArray(config.rewrites) &&
+      config.rewrites.some((r) => new RegExp(`^${r.source}$`).test(cron.path)));
+
+  if (!served) {
+    errors.push(`crons[0].path ${cron.path} matches no function or rewrite — it would 404`);
+  }
+}
 
 // The build command must actually produce what outputDirectory points at,
 // or the deploy fails with "no output directory found" — the error that
