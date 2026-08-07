@@ -64,6 +64,24 @@ export interface PendingApproval {
   readonly stagedAt: Timestamp;
 }
 
+/**
+ * Everything the pipeline knows that cannot be derived from the fill history.
+ *
+ * Positions and cash are rebuilt by replaying fills, so they need no snapshot.
+ * These do not derive from anything: the drawdown peak, the day's opening
+ * equity, staged approvals and the loss-streak breaker are all *observations*
+ * accumulated over time. Losing them on a restart silently moved the baselines
+ * the kill switches measure against, cleared a breaker that had just stopped
+ * trading, and discarded orders a human was about to approve.
+ */
+export interface PipelineState {
+  readonly currentDay: string;
+  readonly startOfDayEquity: number;
+  readonly peakEquity: number;
+  readonly lossStreak: { streak: number; trippedAt: number | null };
+  readonly approvals: readonly PendingApproval[];
+}
+
 export class TradingPipeline {
   private mode: AutomationMode;
   private readonly approvals = new Map<string, PendingApproval>();
@@ -97,6 +115,37 @@ export class TradingPipeline {
 
   get automationMode(): AutomationMode {
     return this.mode;
+  }
+
+  /** Snapshots the state a restart cannot reconstruct. */
+  captureState(): PipelineState {
+    return {
+      currentDay: this.currentDay,
+      startOfDayEquity: this.startOfDayEquity,
+      peakEquity: this.peakEquity,
+      lossStreak: this.lossBreaker.state,
+      approvals: [...this.approvals.values()],
+    };
+  }
+
+  /**
+   * Restores a snapshot taken by {@link captureState}.
+   *
+   * `peakEquity` is taken as the higher of the stored peak and the rebuilt
+   * portfolio's current equity. A stored peak below present equity would mean
+   * the drawdown is measured from a trough, understating it; taking the maximum
+   * keeps the measurement conservative in the direction that matters.
+   */
+  restoreState(state: PipelineState): void {
+    this.currentDay = state.currentDay;
+    this.startOfDayEquity = fromPaise(state.startOfDayEquity);
+    this.peakEquity = fromPaise(Math.max(state.peakEquity, this.config.portfolio.equity));
+    this.lossBreaker.restore(state.lossStreak);
+
+    this.approvals.clear();
+    for (const approval of state.approvals) {
+      this.approvals.set(approval.request.idempotencyKey, approval);
+    }
   }
 
   /**

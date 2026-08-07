@@ -171,6 +171,18 @@ export class LossStreakBreaker {
   get state(): { streak: number; trippedAt: number | null } {
     return { streak: this.streak, trippedAt: this.trippedAt };
   }
+
+  /**
+   * Restores a persisted streak.
+   *
+   * Without this a restart clears the breaker, so a system that had just
+   * stopped itself after four losses resumes trading as though nothing had
+   * happened — and a crash loop turns the breaker into a formality.
+   */
+  restore(state: { streak: number; trippedAt: number | null }): void {
+    this.streak = Math.max(0, Math.trunc(state.streak));
+    this.trippedAt = state.trippedAt;
+  }
 }
 
 export class RiskEngine {

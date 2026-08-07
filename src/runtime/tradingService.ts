@@ -12,16 +12,22 @@
  * restart, and the equity curve after a restart matches the one before it.
  */
 
-import type { AutomationMode, Candle, Fill, Order, Timestamp } from '../domain/types';
+import type {
+  AutomationMode, Candle, Fill, Order, OrderRequest, Timestamp,
+} from '../domain/types';
 import { fromPaise, type Paise } from '../domain/money';
 import { InMemoryAuditLog, type AuditRecord, type AuditEventType } from '../audit/log';
 import { Portfolio, type ClosedTrade } from '../execution/portfolio';
-import { OrderManager } from '../execution/oms';
+import { OrderManager, type SubmitResult } from '../execution/oms';
 import type { BrokerConnector } from '../execution/broker';
 import { RiskEngine } from '../risk/engine';
 import { DEFAULT_RISK_LIMITS, type RiskLimits } from '../risk/types';
 import { MarketCalendar, NSE_HOLIDAYS_2026 } from '../marketdata/calendar';
-import { TradingPipeline, type PipelineOutcome } from '../pipeline/tradingPipeline';
+import {
+  TradingPipeline,
+  type PipelineOutcome,
+  type PipelineState,
+} from '../pipeline/tradingPipeline';
 import type { Strategy } from '../strategy/types';
 import { TrendFollowingStrategy } from '../strategy/trendFollowing';
 import { MeanReversionStrategy } from '../strategy/meanReversion';
@@ -46,6 +52,8 @@ const STATE_KEYS = {
   openingCash: 'account.openingCash',
   peakEquity: 'account.peakEquity',
   killSwitch: 'risk.killSwitch',
+  /** Drawdown peak, day-open equity, staged approvals and the loss breaker. */
+  pipeline: 'pipeline.state',
 } as const;
 
 interface PersistedKillSwitch {
@@ -183,6 +191,17 @@ export class TradingService {
     const positions = await this.repositories.positions.open();
     for (const position of positions) this.portfolio.mark(position.symbol, position.lastPrice);
 
+    // Restored *after* the portfolio is rebuilt, because restoring the peak
+    // compares the stored value against current equity.
+    //
+    // Without this the drawdown peak, the day's opening equity, the loss-streak
+    // breaker and any staged approvals all reset on every restart — so a
+    // restart moved the baselines the kill switches measure against, cleared a
+    // breaker that had just stopped trading, and discarded orders a human was
+    // about to approve. A crash loop turned all three into formalities.
+    const storedPipeline = await this.repositories.state.get<PipelineState>(STATE_KEYS.pipeline);
+    if (storedPipeline) this.pipeline.restoreState(storedPipeline);
+
     await this.oms.reconcile('startup');
     // Publish an equity point and the gauges immediately, so /metrics and the
     // equity curve are populated from boot rather than only after the first
@@ -244,6 +263,24 @@ export class TradingService {
     if (!byBroker) return { ...fill, brokerOrderId: fill.orderId };
 
     return { ...fill, orderId: byBroker.id, brokerOrderId: fill.orderId };
+  }
+
+  /**
+   * Submits a risk-reducing exit and records it.
+   *
+   * The square-off path used to call `oms.submit` directly, which sends the
+   * order but never persists it: the exits were invisible in `/api/orders`,
+   * `findOpen()` did not return them so reconciliation never chased them, and
+   * because the OMS keeps orders in memory a restart lost them entirely — the
+   * subsequent fill then arrived for an order nothing had a record of.
+   *
+   * Exits bypass the size controls by construction (see RiskEngine); what they
+   * must not bypass is the ledger.
+   */
+  async submitExit(request: OrderRequest, correlationId: string): Promise<SubmitResult> {
+    const result = await this.oms.submit(request, correlationId);
+    await this.persistOrder(result.order);
+    return result;
   }
 
   /** Applies a fill from the broker, updating orders, positions and P&L. */
@@ -315,6 +352,11 @@ export class TradingService {
     for (const position of snapshot.positions) {
       await this.repositories.positions.upsert(position, at);
     }
+
+    // Written on every snapshot rather than only on change: snapshot() already
+    // runs after each bar and each fill, which is exactly when these move, and
+    // one small upsert is cheaper than reasoning about which of them changed.
+    await this.repositories.state.set(STATE_KEYS.pipeline, this.pipeline.captureState(), at);
 
     await this.repositories.equity.append({
       timestamp: at,

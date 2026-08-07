@@ -290,6 +290,160 @@ describe('state survives a restart', () => {
   });
 });
 
+describe('risk state survives a restart', () => {
+  /**
+   * The state a restart cannot rebuild from fills: the drawdown peak, the
+   * day's opening equity, the loss-streak breaker, and staged approvals. All
+   * four used to reset on every boot, so a restart moved the baselines the kill
+   * switches measure against and cleared a breaker that had just halted
+   * trading. A crash loop made all of them formalities.
+   */
+  const build = (repositories: ReturnType<typeof memoryRepositories>) =>
+    new TradingService({
+      repositories,
+      broker: new PaperBroker({ costSchedule: ZERO_COST_SCHEDULE, slippageFraction: 0 }),
+      openingCash: fromRupees(1_000_000),
+      calendar,
+      symbols: ['NSE:TEST'],
+    });
+
+  it('keeps the drawdown peak across a restart', async () => {
+    const repositories = memoryRepositories();
+
+    const first = build(repositories);
+    await first.start();
+
+    await first.applyFill({
+      orderId: 'o1', symbol: 'NSE:TEST', side: 'BUY', quantity: 1000,
+      price: fromRupees(100), timestamp: 1000, commission: 0 as Paise,
+    });
+
+    // The peak only advances inside onBar, so drive a bar priced well up.
+    const rally = minuteBars(80).map((c) => ({
+      ...c, open: fromRupees(200), high: fromRupees(200),
+      low: fromRupees(200), close: fromRupees(200),
+    }));
+    await first.onBar('NSE:TEST', rally);
+
+    const peak = first.pipeline.captureState().peakEquity;
+    expect(peak).toBeGreaterThan(fromRupees(1_000_000));
+
+    // Then hand it all back, so current equity sits below the peak.
+    const slump = minuteBars(80).map((c) => ({
+      ...c, open: fromRupees(100), high: fromRupees(100),
+      low: fromRupees(100), close: fromRupees(100),
+    }));
+    await first.onBar('NSE:TEST', slump);
+
+    const second = build(repositories);
+    await second.start();
+
+    // A reset peak would measure drawdown from the trough and report none.
+    expect(second.pipeline.captureState().peakEquity).toBe(peak);
+  });
+
+  it('keeps a tripped loss-streak breaker across a restart', async () => {
+    const repositories = memoryRepositories();
+
+    const first = build(repositories);
+    await first.start();
+    for (let i = 0; i < 4; i += 1) {
+      first.pipeline.recordTradeOutcome(fromRupees(-500), 1000 + i);
+    }
+    await first.snapshot(2000);
+
+    const streak = first.pipeline.captureState().lossStreak.streak;
+    expect(streak).toBe(4);
+
+    const second = build(repositories);
+    await second.start();
+
+    // Resuming with a clean breaker is the system forgetting it had just
+    // stopped itself.
+    expect(second.pipeline.captureState().lossStreak.streak).toBe(streak);
+  });
+
+  it('keeps staged approvals across a restart', async () => {
+    const repositories = memoryRepositories();
+
+    const first = build(repositories);
+    await first.start();
+    await first.setMode('APPROVAL', 'test');
+
+    const bars = minuteBars(200);
+    await repositories.candles.upsertMany(bars);
+    for (let i = 60; i < bars.length; i += 1) {
+      await first.onBar('NSE:TEST', bars.slice(0, i + 1));
+      if (first.pipeline.pendingApprovals().length > 0) break;
+    }
+
+    const staged = first.pipeline.pendingApprovals();
+    if (staged.length === 0) return; // no signal on this series; nothing to assert
+
+    const second = build(repositories);
+    await second.start();
+
+    expect(second.pipeline.pendingApprovals().map((a) => a.request.idempotencyKey))
+      .toEqual(staged.map((a) => a.request.idempotencyKey));
+  });
+
+  it('does not lower the peak below current equity', async () => {
+    // A stored peak beneath present equity would understate drawdown.
+    const repositories = memoryRepositories();
+    await repositories.state.set('pipeline.state', {
+      currentDay: '2026-03-02',
+      startOfDayEquity: fromRupees(500_000),
+      peakEquity: fromRupees(500_000),
+      lossStreak: { streak: 0, trippedAt: null },
+      approvals: [],
+    }, 1000);
+
+    const svc = build(repositories);
+    await svc.start();
+
+    expect(svc.pipeline.captureState().peakEquity).toBe(fromRupees(1_000_000));
+  });
+});
+
+describe('square-off guard', () => {
+  it('does not re-send exits after a restart inside the closing window', async () => {
+    // Square-off runs in the last twenty minutes of the session, so a process
+    // restarting in that window used to re-send exits for every open position
+    // on every tick until the close.
+    const repositories = memoryRepositories();
+    const closing = fromIst('2026-03-02', 15 * 60 + 20);
+
+    const svc = new TradingService({
+      repositories,
+      broker: new PaperBroker({ costSchedule: ZERO_COST_SCHEDULE, slippageFraction: 0 }),
+      openingCash: fromRupees(1_000_000),
+      calendar,
+      symbols: ['NSE:TEST'],
+    });
+    await svc.start();
+
+    await svc.applyFill({
+      orderId: 'o1', symbol: 'NSE:TEST', side: 'BUY', quantity: 10,
+      price: fromRupees(100), timestamp: closing - 60_000, commission: 0 as Paise,
+    });
+
+    const first = new LiveRunner({
+      service: svc, candles: repositories.candles, state: repositories.state,
+    });
+    await first.tick(closing);
+    const afterFirst = (await repositories.orders.findRecent(100)).length;
+    expect(afterFirst).toBeGreaterThan(0);
+
+    // A brand-new runner: same database, empty in-memory guard.
+    const restarted = new LiveRunner({
+      service: svc, candles: repositories.candles, state: repositories.state,
+    });
+    await restarted.tick(closing + 60_000);
+
+    expect((await repositories.orders.findRecent(100)).length).toBe(afterFirst);
+  });
+});
+
 describe('fills from a broker', () => {
   /**
    * Brokers report fills against their own order ids. Nothing bridged that to

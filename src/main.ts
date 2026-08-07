@@ -384,6 +384,9 @@ export async function main(): Promise<void> {
     // The same interval ingestion writes. Reading a different one is a silent
     // no-op: fresh bars land in one series and the strategy reads another.
     interval: barInterval,
+    // Durable square-off guard: a restart inside the closing window would
+    // otherwise re-send exits for every open position on every tick.
+    state: repositories.state,
     canTrade: () => leader.isLeader,
   });
 

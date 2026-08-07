@@ -15,8 +15,11 @@ import type { Interval, Timestamp } from '../domain/types';
 import { toIstDate, type MarketCalendar } from '../marketdata/calendar';
 import type { TradingService } from './tradingService';
 import type { Reconciler } from '../monitoring/reconciliation';
-import type { CandleRepository } from '../persistence/ports';
+import type { CandleRepository, RuntimeStateRepository } from '../persistence/ports';
 import { METRICS, type AlertManager } from '../monitoring/metrics';
+
+/** Where the square-off guard is kept between processes. */
+const SQUARE_OFF_KEY = 'runner.squaredOffOn';
 
 export interface RunnerConfig {
   readonly service: TradingService;
@@ -46,6 +49,13 @@ export interface RunnerConfig {
   readonly interval?: Interval;
   readonly clock?: () => Timestamp;
   /**
+   * Durable store for the square-off guard.
+   *
+   * Optional so tests and single-run harnesses need not supply one; production
+   * always should, or a restart late in the session duplicates exit orders.
+   */
+  readonly state?: RuntimeStateRepository;
+  /**
    * Gate on whether this process may act.
    *
    * Wired to the leader lock in production: a follower still serves the API,
@@ -68,6 +78,14 @@ export class LiveRunner {
   private timer: NodeJS.Timeout | null = null;
   private ticking = false;
   private lastReconcile = 0;
+  /**
+   * The IST date this loop has already squared off on.
+   *
+   * Persisted through {@link RunnerConfig.state}, because losing it is not a
+   * cosmetic reset: square-off runs in the last twenty minutes of the session,
+   * so a process that restarts in that window re-sends exit orders for every
+   * open position, every tick, until the close.
+   */
   private squaredOffOn = '';
   private running = false;
   /**
@@ -193,6 +211,11 @@ export class LiveRunner {
     }
   }
 
+  private async markSquaredOff(day: string, now: Timestamp): Promise<void> {
+    this.squaredOffOn = day;
+    await this.config.state?.set(SQUARE_OFF_KEY, day, now);
+  }
+
   private async reconcile(now: Timestamp): Promise<void> {
     if (!this.config.reconciler) return;
 
@@ -212,13 +235,24 @@ export class LiveRunner {
     const today = toIstDate(now);
     if (this.squaredOffOn === today) return;
 
-    const open = this.config.service.portfolio.getOpenPositions();
-    if (open.length === 0) {
+    // Consult the durable record too: this process may have restarted inside
+    // the square-off window, in which case its in-memory guard is empty while
+    // the exits have already gone out.
+    const persisted = await this.config.state?.get<string>(SQUARE_OFF_KEY);
+    if (persisted === today) {
       this.squaredOffOn = today;
       return;
     }
 
-    this.squaredOffOn = today;
+    const open = this.config.service.portfolio.getOpenPositions();
+    if (open.length === 0) {
+      await this.markSquaredOff(today, now);
+      return;
+    }
+
+    // Recorded *before* sending, not after: a crash midway through would
+    // otherwise re-send exits for the positions already closed.
+    await this.markSquaredOff(today, now);
 
     await this.config.alerts?.dispatch({
       severity: 'info',
@@ -243,7 +277,7 @@ export class LiveRunner {
 
       // Square-off is risk-reducing, so it bypasses the size controls by
       // construction (see RiskEngine) and goes straight to the OMS.
-      await this.config.service.oms.submit(request, `square-off-${today}`);
+      await this.config.service.submitExit(request, `square-off-${today}`);
     }
   }
 }
