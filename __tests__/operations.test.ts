@@ -548,7 +548,7 @@ describe('KiteSession', () => {
   it('sends the sha256 checksum Kite expects', async () => {
     let sentBody = '';
     const fetchImpl = jest.fn(async (_url: unknown, init?: RequestInit) => {
-      sentBody = String(init?.body);
+      sentBody = typeof init?.body === 'string' ? init.body : '';
       return jsonResponse({ status: 'success', data: { access_token: 'fresh' } });
     }) as unknown as typeof fetch;
 
@@ -827,7 +827,7 @@ describe('LiveRunner leadership gate', () => {
   it('delivers an enqueued alert to the webhook', async () => {
     const posted: unknown[] = [];
     const fetchImpl = jest.fn(async (_url: unknown, init?: RequestInit) => {
-      posted.push(JSON.parse(String(init?.body)));
+      posted.push(JSON.parse(typeof init?.body === 'string' ? init.body : ''));
       return new Response('', { status: 200 });
     }) as unknown as typeof fetch;
 

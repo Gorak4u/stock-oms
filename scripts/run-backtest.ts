@@ -1,19 +1,24 @@
 /**
- * Runnable demonstration of the full workflow.
+ * Backtests the bundled strategies over real market data.
  *
- * Generates a deterministic synthetic series (no `Math.random`, so the output
- * is reproducible), runs every bundled strategy over it, and prints the
- * metrics — then walk-forward validates the trend-following strategy.
+ * Two sources, because there are two situations you run this in:
  *
- * The numbers below are meaningless as evidence about real markets: synthetic
- * data has none of the structure a strategy is trying to exploit. It exists to
- * show the machinery working end to end.
+ *   npm run backtest -- --symbol NSE:RELIANCE --from 2024-01-01 --to 2025-12-31
+ *   npm run backtest -- --csv ./data/reliance-daily.csv
  *
- *   npm run backtest
+ * The first reads the `candle` table this platform ingests into, so it measures
+ * strategies against exactly the bars the live loop would have traded on. The
+ * second takes an OHLC export, for data the platform has not ingested.
+ *
+ * There is deliberately no generated-series mode. A random walk has none of the
+ * structure a strategy exists to exploit, so a number produced from one is not a
+ * weak result — it is not a result at all, and printing it next to real metrics
+ * in the same table invites exactly the confusion this tool should prevent.
  */
 
+import { readFileSync } from 'node:fs';
 import { format, fromRupees } from '../src/domain/money';
-import type { Candle } from '../src/domain/types';
+import type { Candle, Interval } from '../src/domain/types';
 import { BacktestEngine } from '../src/backtest/engine';
 import { walkForward } from '../src/backtest/walkForward';
 import { DEFAULT_RISK_LIMITS } from '../src/risk/types';
@@ -23,44 +28,122 @@ import { MomentumStrategy } from '../src/strategy/momentum';
 import { VolatilityBreakoutStrategy } from '../src/strategy/volatility';
 import type { Strategy } from '../src/strategy/types';
 import type { PerformanceMetrics } from '../src/backtest/metrics';
+import { Database, databaseOptionsFromEnv } from '../src/persistence/postgres';
+import { parseCsv } from '../src/browser';
 
-const DAY = 86_400_000;
-const START = Date.parse('2021-01-01T00:00:00Z');
+/** Enough bars to warm the slowest indicator and still leave something to measure. */
+const MIN_BARS = 120;
 
-function syntheticSeries(length: number, seed = 42): Candle[] {
-  let state = seed;
-  const next = (): number => {
-    state = (state * 1103515245 + 12345) % 2147483648;
-    return state / 2147483648;
+interface Options {
+  csv: string | null;
+  symbol: string | null;
+  interval: Interval;
+  from: string;
+  to: string;
+  capital: number;
+}
+
+function usage(message?: string): never {
+  if (message) console.error(`error: ${message}\n`);
+  console.error(`Usage: npm run backtest -- [options]
+
+  --symbol SYM      Symbol to read from the candle table, e.g. NSE:RELIANCE
+  --interval I      Bar size to read (default: 1d)
+  --from DATE       Inclusive start, YYYY-MM-DD (default: 2000-01-01)
+  --to DATE         Inclusive end, YYYY-MM-DD (default: today)
+  --csv PATH        Backtest an OHLC CSV export instead of the database
+  --capital N       Opening capital in rupees (default: 1000000)
+
+Supply exactly one of --symbol or --csv.
+Environment: DATABASE_URL (required for --symbol)`);
+  process.exit(1);
+}
+
+function parseArgs(argv: readonly string[]): Options {
+  const options: Options = {
+    csv: null,
+    symbol: null,
+    interval: '1d',
+    from: '2000-01-01',
+    to: new Date().toISOString().slice(0, 10),
+    capital: 1_000_000,
   };
 
-  const candles: Candle[] = [];
-  let price = 1500;
-  // A slow regime cycle so trend and mean-reversion strategies both see
-  // conditions they are built for.
-  for (let i = 0; i < length; i += 1) {
-    const regime = Math.sin(i / 120) * 0.0012;
-    const shock = (next() - 0.5) * 0.025 + regime;
-    const open = price;
-    const close = Math.max(1, open * (1 + shock));
-    const high = Math.max(open, close) * (1 + next() * 0.008);
-    const low = Math.min(open, close) * (1 - next() * 0.008);
+  for (let i = 0; i < argv.length; i += 1) {
+    const flag = argv[i];
+    const value = argv[i + 1];
+    if (!value && flag !== undefined) usage(`${flag} needs a value`);
 
-    candles.push({
-      symbol: 'NSE:SYNTH',
-      interval: '1d',
-      timestamp: START + i * DAY,
-      open: fromRupees(open),
-      high: fromRupees(high),
-      low: fromRupees(low),
-      close: fromRupees(close),
-      volume: 250_000 + Math.floor(next() * 100_000),
-    });
-
-    price = close;
+    switch (flag) {
+      case '--csv': options.csv = value!; i += 1; break;
+      case '--symbol': options.symbol = value!; i += 1; break;
+      case '--interval': options.interval = value! as Interval; i += 1; break;
+      case '--from': options.from = value!; i += 1; break;
+      case '--to': options.to = value!; i += 1; break;
+      case '--capital': options.capital = Number(value); i += 1; break;
+      default: usage(`unknown option ${flag}`);
+    }
   }
 
-  return candles;
+  if (options.csv && options.symbol) usage('--csv and --symbol are mutually exclusive');
+  if (!options.csv && !options.symbol) usage('supply --symbol or --csv');
+  if (!Number.isFinite(options.capital) || options.capital <= 0) {
+    usage('--capital must be a positive number');
+  }
+
+  return options;
+}
+
+function isoToTimestamp(date: string, endOfDay = false): number {
+  const parsed = Date.parse(`${date}T${endOfDay ? '23:59:59.999' : '00:00:00.000'}Z`);
+  if (Number.isNaN(parsed)) usage(`invalid date: ${date} (expected YYYY-MM-DD)`);
+  return parsed;
+}
+
+/** Reads bars from the platform's own candle table. */
+async function loadFromDatabase(options: Options): Promise<{ candles: Candle[]; source: string }> {
+  const url = process.env.DATABASE_URL;
+  if (!url) usage('DATABASE_URL is required when reading with --symbol');
+
+  const database = new Database(url, databaseOptionsFromEnv());
+  try {
+    const candles = await database.repositories().candles.range(
+      options.symbol!,
+      options.interval,
+      isoToTimestamp(options.from),
+      isoToTimestamp(options.to, true),
+    );
+    return {
+      candles,
+      source: `${options.symbol} ${options.interval} from the candle table, ${options.from} to ${options.to}`,
+    };
+  } finally {
+    await database.close();
+  }
+}
+
+/**
+ * Reads bars from a CSV export.
+ *
+ * Rejected rows are reported rather than dropped: a file that silently lost a
+ * tenth of its bars produces a plausible-looking metric measured over data the
+ * operator did not think they were testing.
+ */
+function loadFromCsv(options: Options): { candles: Candle[]; source: string } {
+  const text = readFileSync(options.csv!, 'utf8');
+  const parsed = parseCsv(text, options.csv!);
+
+  if (parsed.errors.length > 0) {
+    console.error(`CSV problems: ${parsed.errors.join(' ')}`);
+  }
+  if (parsed.skipped > 0) {
+    console.error(`${parsed.skipped} row(s) rejected by candle validation.`);
+  }
+
+  return {
+    candles: parsed.candles,
+    source: `${parsed.candles.length} bars from ${options.csv}`,
+  };
 }
 
 function pct(value: number): string {
@@ -81,12 +164,25 @@ function reportRow(name: string, metrics: PerformanceMetrics): string {
 }
 
 async function main(): Promise<void> {
-  const candles = syntheticSeries(1250); // ~5 years of sessions
-  const openingCash = fromRupees(1_000_000);
+  const options = parseArgs(process.argv.slice(2));
+  const { candles, source } = options.csv
+    ? loadFromCsv(options)
+    : await loadFromDatabase(options);
 
-  console.log('AI Trading Platform — backtest demonstration');
-  console.log(`Synthetic series: ${candles.length} daily bars, opening capital ${format(openingCash)}`);
-  console.log('NOTE: synthetic data. These numbers say nothing about real markets.\n');
+  if (candles.length < MIN_BARS) {
+    console.error(
+      `Need at least ${MIN_BARS} bars to warm up the indicators; got ${candles.length}.` +
+        (options.symbol ? ' Run `npm run backfill` to load history first.' : ''),
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  const openingCash = fromRupees(options.capital);
+
+  console.log('AI Trading Platform — backtest');
+  console.log(`Data: ${source}`);
+  console.log(`Bars: ${candles.length}, opening capital ${format(openingCash)}\n`);
 
   const strategies: [string, Strategy<unknown>][] = [
     ['Trend following', new TrendFollowingStrategy()],
@@ -120,6 +216,17 @@ async function main(): Promise<void> {
     }
   }
 
+  // Walk-forward needs enough bars for at least one train/test split; below that
+  // the report would be empty and the efficiency figure meaningless.
+  const trainBars = 400;
+  const testBars = 150;
+  if (candles.length < trainBars + testBars) {
+    console.log(
+      `\nWalk-forward validation skipped — needs ${trainBars + testBars} bars, have ${candles.length}.`,
+    );
+    return;
+  }
+
   console.log('\nWalk-forward validation — trend following');
   console.log('-'.repeat(82));
 
@@ -134,14 +241,14 @@ async function main(): Promise<void> {
     {
       openingCash,
       limits: DEFAULT_RISK_LIMITS,
-      trainBars: 400,
-      testBars: 150,
+      trainBars,
+      testBars,
       objective: (metrics) => metrics.sharpe,
     },
   );
 
   for (const [index, fold] of report.folds.entries()) {
-    const params = fold.selectedParams as { fastPeriod: number; slowPeriod: number };
+    const params = fold.selectedParams;
     console.log(
       `  fold ${index + 1}: EMA ${params.fastPeriod}/${params.slowPeriod} — ` +
         `in-sample ${pct(fold.trainMetrics.totalReturn)}, ` +

@@ -1,0 +1,33 @@
+version: 2
+
+# Dependency updates arrive as pull requests, which means they go through the
+# same CI gate as everything else — typecheck, lint, the adapter suites against
+# real Postgres and Redis, and the end-to-end smoke boot. An update that breaks
+# order handling fails there rather than in a session.
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: sunday
+    open-pull-requests-limit: 5
+    groups:
+      # Grouped so a routine week is one reviewable PR rather than eight.
+      # Production dependencies stay separate: `pg`, `fastify` and `ws` sit in
+      # the order and market-data paths, and those deserve their own review
+      # rather than being read past in a batch.
+      dev-dependencies:
+        dependency-type: development
+        update-types: [minor, patch]
+      production-patches:
+        dependency-type: production
+        update-types: [patch]
+    labels:
+      - dependencies
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    labels:
+      - dependencies

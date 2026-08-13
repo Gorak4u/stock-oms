@@ -65,6 +65,9 @@ export function sub(a: Paise, b: Paise): Paise {
 }
 
 export function neg(a: Paise): Paise {
+  // The one place a Paise is negated directly; every other site calls this,
+  // so the branded type is never silently unwrapped into a bare number.
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-unary-minus
   return fromPaise(-a);
 }
 

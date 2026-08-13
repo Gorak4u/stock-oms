@@ -33,6 +33,19 @@ export interface CalendarConfig {
   readonly sessionCloseMinute?: number;
   /** Sessions that deviate from the default (muhurat trading, shortened days). */
   readonly specialSessions?: Readonly<Record<IsoDate, { openMinute: number; closeMinute: number }>>;
+  /**
+   * Calendar years the holiday list is known to be complete for.
+   *
+   * Omitted means unbounded — every year is treated as covered, which is what
+   * backtests over arbitrary history and tests of session mechanics want, and
+   * it is why `holidays: []` still describes a market that simply has no
+   * holidays rather than one nobody has configured.
+   *
+   * Production sets it, via {@link buildCalendar}, because there the difference
+   * matters: a list entered for one year says nothing about the next, and
+   * silently assuming otherwise trades through unlisted holidays.
+   */
+  readonly coveredYears?: readonly number[];
 }
 
 export const DEFAULT_SESSION_OPEN_MINUTE = 9 * 60 + 15;
@@ -75,6 +88,8 @@ export class MarketCalendar {
   private readonly specialSessions: Readonly<
     Record<IsoDate, { openMinute: number; closeMinute: number }>
   >;
+  /** `null` means unbounded coverage — see {@link CalendarConfig.coveredYears}. */
+  private readonly covered: ReadonlySet<number> | null;
 
   constructor(config: CalendarConfig) {
     this.holidays = new Set(config.holidays);
@@ -82,9 +97,29 @@ export class MarketCalendar {
     this.closeMinute = config.sessionCloseMinute ?? DEFAULT_SESSION_CLOSE_MINUTE;
     this.specialSessions = config.specialSessions ?? {};
 
+    this.covered = config.coveredYears ? new Set(config.coveredYears) : null;
+
     if (this.openMinute >= this.closeMinute) {
       throw new Error('session open must precede session close');
     }
+  }
+
+  /** Years the holiday list covers, or `null` when coverage is unbounded. */
+  get coveredYears(): number[] | null {
+    return this.covered ? [...this.covered].sort((a, b) => a - b) : null;
+  }
+
+  /**
+   * Whether the holiday list covers the year this date falls in.
+   *
+   * The exchange publishes its holiday list one year at a time, so any list
+   * baked into a build goes stale on 1 January. An uncovered year is not a
+   * calendar with a few missing days — it is a calendar that says the market is
+   * open on Republic Day, and a loop that would place orders into a closed
+   * exchange all day and log nothing unusual.
+   */
+  isCovered(date: IsoDate): boolean {
+    return this.covered === null || this.covered.has(Number(date.slice(0, 4)));
   }
 
   isWeekend(date: IsoDate): boolean {
@@ -101,8 +136,18 @@ export class MarketCalendar {
     return !this.isWeekend(date) && !this.isHoliday(date);
   }
 
-  /** The continuous-trading window for a date, or `null` if the market is shut. */
+  /**
+   * The continuous-trading window for a date, or `null` if the market is shut.
+   *
+   * A date outside {@link isCovered} returns `null` — the market is treated as
+   * closed rather than assumed open. That is deliberately the conservative
+   * direction: refusing to trade on a day that was in fact a session costs an
+   * opportunity, while trading through an unlisted holiday sends orders into a
+   * closed exchange. Composition roots alert on the uncovered year at startup
+   * so this shows up as a loud configuration error, not as a silent flat day.
+   */
   sessionFor(date: IsoDate): SessionWindow | null {
+    if (!this.isCovered(date)) return null;
     if (!this.isTradingDay(date)) return null;
     const special = this.specialSessions[date];
     const openMinute = special?.openMinute ?? this.openMinute;
@@ -163,11 +208,43 @@ export class MarketCalendar {
   }
 }
 
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
 /**
- * NSE trading holidays.
+ * Parses an operator-supplied holiday list.
  *
- * Verify against the exchange circular each year before trading against them —
- * these are a development default, not an authoritative source.
+ * The exchange publishes its holidays annually, usually in December for the
+ * year that follows, which is always after the build that would have to carry
+ * them. So the list is configuration: an operator pastes the circular into
+ * `NSE_HOLIDAYS` and the calendar covers the new year without a deploy.
+ *
+ * Malformed input throws rather than being skipped. A typo that silently
+ * dropped one date would produce a calendar that is wrong on exactly one day
+ * of the year, and the first sign of it would be orders rejected by a closed
+ * exchange.
+ */
+export function parseHolidays(raw: string): IsoDate[] {
+  const dates = raw
+    .split(/[,\s]+/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+  for (const date of dates) {
+    if (!ISO_DATE.test(date) || Number.isNaN(Date.parse(`${date}T00:00:00.000Z`))) {
+      throw new Error(`invalid holiday date: ${date} (expected YYYY-MM-DD)`);
+    }
+  }
+
+  return [...new Set(dates)].sort();
+}
+
+/**
+ * NSE trading holidays for 2026.
+ *
+ * Verify against the exchange circular before trading against them. This list
+ * covers 2026 and nothing else: from 1 January 2027 the calendar reports itself
+ * uncovered and refuses to open a session until `NSE_HOLIDAYS` supplies the new
+ * year. See {@link MarketCalendar.isCovered}.
  */
 export const NSE_HOLIDAYS_2026: readonly IsoDate[] = [
   '2026-01-26', // Republic Day
@@ -188,3 +265,21 @@ export const NSE_HOLIDAYS_2026: readonly IsoDate[] = [
   '2026-11-24', // Guru Nanak Jayanti
   '2026-12-25', // Christmas
 ];
+
+/**
+ * The calendar the application runs on.
+ *
+ * `NSE_HOLIDAYS`, when set, *replaces* the built-in list rather than adding to
+ * it, so an operator entering next year's circular does not silently inherit a
+ * stale set of dates alongside it. Supply every year you intend to trade.
+ */
+export function buildCalendar(rawHolidays?: string): MarketCalendar {
+  const holidays = rawHolidays?.trim() ? parseHolidays(rawHolidays) : NSE_HOLIDAYS_2026;
+
+  // Coverage is derived from the list rather than left unbounded: this is the
+  // production path, and here a list that stops at one December must not be
+  // read as a promise about the following January.
+  const coveredYears = [...new Set(holidays.map((date) => Number(date.slice(0, 4))))];
+
+  return new MarketCalendar({ holidays, coveredYears });
+}

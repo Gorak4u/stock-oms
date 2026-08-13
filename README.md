@@ -148,10 +148,11 @@ See **[DEPLOYMENT.md](DEPLOYMENT.md)**.
 ```bash
 npm install
 npm run typecheck
-npm test                # 638 tests
+npm run lint
+npm test                # 724 tests
 npm run build && npm start
 
-npm run backtest        # terminal demo over a synthetic series
+npm run backtest -- --csv ./data/daily.csv    # or --symbol NSE:RELIANCE
 npm run build:console   # dist/console.html — interactive, open in a browser
 ```
 
@@ -167,20 +168,26 @@ A fresh install has an empty `candle` table, which means an empty dashboard and
 a loop with nothing to decide on. That is correct and completely uninformative —
 you cannot tell a working system from a broken one when both show zero.
 
+Fill it with real history rather than generated data:
+
 ```bash
-npm run seed -- --reset      # synthetic data, ~400 trading days, 3 symbols
+npm run backfill -- --symbols NSE:RELIANCE,NSE:TCS --interval 1d --days 400
 npm start                    # then open http://localhost:8080
 ```
 
-The seed does not insert rows into `order` and `trade`. It drives the real
-pipeline — signal → risk → sizing → OMS → paper broker → fill → portfolio →
-persistence → audit — one bar at a time, so what you end up looking at was
-produced by the code that would run against a live broker. It leaves the system
-in `MANUAL`, and refuses to run against a database that already holds candles
-unless you pass `--reset`.
+The backfill needs Kite credentials, because that is where the bars come from.
+There is deliberately no synthetic seeder: a database holding generated bars
+next to real ones cannot be told apart afterwards, and every figure computed
+from it — P&L, drawdown, the risk engine's own baselines — is fiction that
+looks exactly like measurement.
 
-The data is synthetic. It demonstrates that the pipeline carries a decision from
-bar to fill to ledger; it says nothing about whether any strategy makes money.
+To exercise the pipeline without a broker account, backtest a CSV export
+instead. That runs the same signal → risk → sizing → OMS → fill → portfolio
+path, against data you can vouch for:
+
+```bash
+npm run backtest -- --csv ./data/reliance-daily.csv
+```
 
 ### Loading market data
 
@@ -208,6 +215,58 @@ Re-running is safe: bars are upserted by `(symbol, interval, timestamp)`, so a
 corrected file overwrites what it should and changes nothing else. Once running
 with `BROKER=zerodha`, the process keeps the recent window current on its own.
 
+### The live feed, and when you need it
+
+Backfill and the periodic sync both read Kite's **historical** endpoint. That
+endpoint does not publish a bar until it has closed, and it is rate-limited far
+below a quote feed. On daily bars this is invisible. On minute bars it means
+every decision is taken against a bar the market has already moved past.
+
+`LIVE_FEED=1` opens Kite's streaming WebSocket, assembles ticks into bars and
+writes them as each bucket closes:
+
+```bash
+LIVE_FEED=1 BROKER=zerodha BAR_INTERVAL=1m SYMBOLS=NSE:RELIANCE,NSE:TCS npm start
+```
+
+The two sources are deliberately not exclusive. The historical sync keeps
+running, and because bars are upserted, the exchange's own settled bar later
+replaces the one assembled from ticks. That ordering is the point: trade on the
+fast copy, keep the accurate one.
+
+Three things it does that a plain socket would not:
+
+- **A watchdog on silence, not just on close.** Kite heartbeats about once a
+  second. A connection that stays open and stops delivering is the dangerous
+  state — the socket reports healthy while the strategy trades on a stale bar —
+  so no frame within `TICKER_HEARTBEAT_MS` forces a reconnect.
+- **Ticks are validated before they reach a bar.** A fat-finger print reaches
+  the strategy as a genuine signal and the risk engine as a genuine mark, so the
+  price-band check sits in front of the aggregator.
+- **It follows the leader lock.** Kite caps concurrent ticker connections; a
+  demoted process that kept streaming would deny the new leader its data.
+
+`/health` reports `market-feed` unhealthy when the session is open and the feed
+is connected but silent — which is the failure that is invisible to anything
+only inspecting connection state.
+
+### The trading calendar expires
+
+The exchange publishes its holiday list one year at a time, so the list compiled
+into any build goes stale on 1 January. An uncovered year is not a calendar
+missing a few days — it is one that says the market is open on Republic Day.
+
+So the calendar tracks which years it actually covers. In an uncovered year every
+session reads as closed, `/health` reports `calendar` unhealthy, and a critical
+alert fires at startup. Supply the year's circular to clear it:
+
+```bash
+NSE_HOLIDAYS="2027-01-26,2027-03-11,2027-08-15"   # replaces the built-in list
+```
+
+Refusing to trade costs an opportunity; trading through an unlisted holiday
+sends orders into a closed exchange, so the default leans the first way.
+
 ### Configuration
 
 | Variable | Default | Meaning |
@@ -224,6 +283,11 @@ with `BROKER=zerodha`, the process keeps the recent window current on its own.
 | `BAR_INTERVAL` | `1m` | Bar size the loop trades on |
 | `MARKET_DATA_SYNC_MS` | `60000` | How often to pull fresh bars |
 | `MARKET_DATA_MAX_AGE_MS` | `900000` | Data older than this is unhealthy mid-session |
+| `NSE_HOLIDAYS` | 2026 list | Exchange holidays, `YYYY-MM-DD`; **replaces** the built-in list |
+| `LIVE_FEED` | `false` | Stream quotes over the Kite WebSocket (see below) |
+| `LIVE_FEED_FLUSH_MS` | `5000` | How often assembled bars are written |
+| `TICKER_HEARTBEAT_MS` | `10000` | Reconnect after this long with no frame |
+| `TICKER_STALE_MS` | `120000` | Connected-but-silent for this long is unhealthy |
 | `API_PUBLIC_READS` | `false` | Serve reads without a token (see below) |
 | `CORS_ORIGINS` | empty | Browser origins allowed to call the API |
 | `RATE_LIMIT_PER_MINUTE` | `300` | Per-client request cap |
@@ -356,8 +420,8 @@ separate one. `npm run build` produces it as part of the normal build.
 
 It runs the **real engine** compiled to the browser — same strategy, risk,
 sizing, cost and fill code as the Node build, so results match `npm run backtest`
-exactly. It takes synthetic data or your own OHLC CSV, and surfaces which risk
-control refused each signal. Because it computes entirely client-side and
+exactly. It takes your own OHLC CSV — the only input it accepts — and surfaces
+which risk control refused each signal. Because it computes entirely client-side and
 reaches nothing, it is also the one page that can be published on its own
 (`npm run build:static`) without exposing the engine.
 
@@ -366,7 +430,7 @@ asserts the two agree byte for byte, including at the padding boundaries.
 
 ## Testing
 
-638 tests. The parts worth calling out:
+724 tests. The parts worth calling out:
 
 - **One contract suite, two implementations.** The in-memory and Postgres
   repositories run the same 45 cases, so a divergence fails the build. It has
@@ -377,6 +441,12 @@ asserts the two agree byte for byte, including at the padding boundaries.
   which CI sets, they fail instead of skipping.
 - **Numerical checks.** Options greeks are pinned against numerical derivatives
   and put-call parity; the crypto shim against published SHA-256 vectors.
+- **The wire format, not the wrapper.** The Kite ticker's binary frames are
+  built byte by byte in the tests — quote, full, LTP and index packets, a
+  truncated frame, a heartbeat — so the parser is checked against the layout
+  rather than against its own assumptions. The connection tests drive
+  reconnection, re-subscription and the silent-socket watchdog through a fake
+  socket, with no network involved.
 - **An end-to-end smoke test in CI.** It boots the real `main.js` against a real
   database, asserts the health report, that a read without a token is refused,
   and that SIGTERM drains rather than truncates. Unit tests cover every layer
@@ -437,10 +507,10 @@ Deliberately not built:
 - [ ] Continuous monitoring
 
 The engine, the metrics and the walk-forward machinery are ready and tested.
-What is missing is real market history. Synthetic data can only demonstrate
-that the machinery runs — on a random walk the strategies return roughly zero
-and walk-forward efficiency correctly reports the in-sample results as fitted
-noise. That is the system working, not a result.
+What is missing is real market history, and nothing in this repository will
+manufacture a stand-in for it: a generated series has none of the structure a
+strategy exists to exploit, so a metric measured on one is not a weak result but
+an absence of one.
 
 **The next step is data, not code** — and there is now a supported way to load
 it. `npm run backfill` fills the `candle` table from a CSV dump or from the

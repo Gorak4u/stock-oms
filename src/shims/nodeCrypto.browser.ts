@@ -101,7 +101,9 @@ class Hash {
   }
 
   digest(encoding: 'hex'): string {
-    if (encoding !== 'hex') throw new Error(`shim supports hex only, got ${encoding}`);
+    // Narrowed to `never` by the signature, so it needs an explicit String()
+    // — but the check stays: JS callers are not bound by the type.
+    if (encoding !== 'hex') throw new Error(`shim supports hex only, got ${String(encoding)}`);
 
     const total = this.chunks.reduce((sum, chunk) => sum + chunk.length, 0);
     const joined = new Uint8Array(total);

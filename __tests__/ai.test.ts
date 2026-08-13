@@ -1,4 +1,4 @@
-import { fromRupees, type Paise } from '../src/domain/money';
+import { fromRupees } from '../src/domain/money';
 import type { Candle, Signal } from '../src/domain/types';
 import { StandardFeatureExtractor, FeatureScaler } from '../src/ai/features';
 import { evaluateModel, LogisticModel } from '../src/ai/logisticModel';

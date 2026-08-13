@@ -220,6 +220,87 @@ export class Database {
 // Orders
 // ---------------------------------------------------------------------------
 
+/**
+ * Row shapes as Postgres returns them.
+ *
+ * Named rather than inlined on each `map` so they can be handed to
+ * `pool.query<Row>()`. Without that type argument `pg` types every row as
+ * `any`, and the mapping below — which is where a database column becomes a
+ * price, a quantity or an audit hash — is exactly the boundary that should not
+ * be taking `any` on trust.
+ *
+ * Numeric columns arrive as strings: `pg` does not coerce `NUMERIC`, because
+ * doing so through a float is how integer paise stop being exact.
+ */
+interface FillRow {
+  order_id: string;
+  broker_order_id: string | null;
+  symbol: string;
+  side: Side;
+  quantity: number;
+  price: string;
+  commission: string;
+  ts: string;
+}
+
+interface ClosedTradeRow {
+  symbol: string;
+  direction: 'LONG' | 'SHORT';
+  quantity: number;
+  entry_price: string;
+  exit_price: string;
+  pnl: string;
+  closed_at: string;
+}
+
+interface PositionRow {
+  symbol: string;
+  quantity: number;
+  average_price: string;
+  realised_pnl: string;
+  last_price: string;
+}
+
+interface EquitySnapshotRow {
+  ts: string;
+  equity: string;
+  cash: string;
+  realised_pnl: string;
+  unrealised_pnl: string;
+}
+
+interface AuditRow {
+  sequence: string;
+  ts: string;
+  type: AuditEventType;
+  correlation_id: string;
+  payload: Record<string, unknown>;
+  previous_hash: string;
+  hash: string;
+}
+
+interface CandleRow {
+  symbol: string;
+  interval: Interval;
+  ts: string;
+  open: string;
+  high: string;
+  low: string;
+  close: string;
+  volume: string;
+}
+
+interface ModelRow {
+  id: string;
+  version: string;
+  feature_names: string[];
+  weights: number[];
+  bias: number;
+  metrics: ValidationMetrics | null;
+  promoted: boolean;
+  registered_at: string;
+}
+
 interface OrderRow {
   id: string;
   idempotency_key: string;
@@ -376,10 +457,7 @@ export class PgFillRepository implements FillRepository {
     return (rowCount ?? 0) > 0;
   }
 
-  private map(row: {
-    order_id: string; broker_order_id: string | null; symbol: string; side: Side;
-    quantity: number; price: string; commission: string; ts: string;
-  }): Fill {
+  private map(row: FillRow): Fill {
     return {
       ...(row.broker_order_id ? { brokerOrderId: row.broker_order_id } : {}),
       orderId: row.order_id,
@@ -393,14 +471,14 @@ export class PgFillRepository implements FillRepository {
   }
 
   async since(timestamp: Timestamp): Promise<Fill[]> {
-    const { rows } = await this.pool.query(
+    const { rows } = await this.pool.query<FillRow>(
       'SELECT * FROM trading.fill WHERE ts >= $1 ORDER BY ts', [timestamp],
     );
     return rows.map((r) => this.map(r));
   }
 
   async forOrder(orderId: string): Promise<Fill[]> {
-    const { rows } = await this.pool.query(
+    const { rows } = await this.pool.query<FillRow>(
       'SELECT * FROM trading.fill WHERE order_id = $1 ORDER BY ts', [orderId],
     );
     return rows.map((r) => this.map(r));
@@ -424,10 +502,7 @@ export class PgTradeRepository implements TradeRepository {
     );
   }
 
-  private map(row: {
-    symbol: string; direction: 'LONG' | 'SHORT'; quantity: number;
-    entry_price: string; exit_price: string; pnl: string; closed_at: string;
-  }): ClosedTrade {
+  private map(row: ClosedTradeRow): ClosedTrade {
     return {
       symbol: row.symbol,
       direction: row.direction,
@@ -440,14 +515,14 @@ export class PgTradeRepository implements TradeRepository {
   }
 
   async recent(limit: number): Promise<ClosedTrade[]> {
-    const { rows } = await this.pool.query(
+    const { rows } = await this.pool.query<ClosedTradeRow>(
       'SELECT * FROM trading.closed_trade ORDER BY closed_at DESC LIMIT $1', [limit],
     );
     return rows.map((r) => this.map(r));
   }
 
   async between(from: Timestamp, to: Timestamp): Promise<ClosedTrade[]> {
-    const { rows } = await this.pool.query(
+    const { rows } = await this.pool.query<ClosedTradeRow>(
       'SELECT * FROM trading.closed_trade WHERE closed_at BETWEEN $1 AND $2 ORDER BY closed_at',
       [from, to],
     );
@@ -477,10 +552,7 @@ export class PgPositionRepository implements PositionRepository {
     );
   }
 
-  private map(row: {
-    symbol: string; quantity: number; average_price: string;
-    realised_pnl: string; last_price: string;
-  }): Position {
+  private map(row: PositionRow): Position {
     const quantity = row.quantity;
     const averagePrice = toPaise(row.average_price);
     const lastPrice = toPaise(row.last_price);
@@ -495,19 +567,19 @@ export class PgPositionRepository implements PositionRepository {
   }
 
   async all(): Promise<Position[]> {
-    const { rows } = await this.pool.query('SELECT * FROM trading.position ORDER BY symbol');
+    const { rows } = await this.pool.query<PositionRow>('SELECT * FROM trading.position ORDER BY symbol');
     return rows.map((r) => this.map(r));
   }
 
   async open(): Promise<Position[]> {
-    const { rows } = await this.pool.query(
+    const { rows } = await this.pool.query<PositionRow>(
       'SELECT * FROM trading.position WHERE quantity <> 0 ORDER BY symbol',
     );
     return rows.map((r) => this.map(r));
   }
 
   async find(symbol: string): Promise<Position | null> {
-    const { rows } = await this.pool.query(
+    const { rows } = await this.pool.query<PositionRow>(
       'SELECT * FROM trading.position WHERE symbol = $1', [symbol],
     );
     return rows[0] ? this.map(rows[0]) : null;
@@ -532,9 +604,7 @@ export class PgEquityRepository implements EquityRepository {
     );
   }
 
-  private map(row: {
-    ts: string; equity: string; cash: string; realised_pnl: string; unrealised_pnl: string;
-  }): EquitySnapshot {
+  private map(row: EquitySnapshotRow): EquitySnapshot {
     return {
       timestamp: toNumber(row.ts),
       equity: toPaise(row.equity),
@@ -545,14 +615,14 @@ export class PgEquityRepository implements EquityRepository {
   }
 
   async between(from: Timestamp, to: Timestamp): Promise<EquitySnapshot[]> {
-    const { rows } = await this.pool.query(
+    const { rows } = await this.pool.query<EquitySnapshotRow>(
       'SELECT * FROM trading.equity_point WHERE ts BETWEEN $1 AND $2 ORDER BY ts', [from, to],
     );
     return rows.map((r) => this.map(r));
   }
 
   async latest(): Promise<EquitySnapshot | null> {
-    const { rows } = await this.pool.query(
+    const { rows } = await this.pool.query<EquitySnapshotRow>(
       'SELECT * FROM trading.equity_point ORDER BY ts DESC LIMIT 1',
     );
     return rows[0] ? this.map(rows[0]) : null;
@@ -576,10 +646,7 @@ export class PgAuditRepository implements AuditRepository {
     );
   }
 
-  private map(row: {
-    sequence: string; ts: string; type: AuditEventType; correlation_id: string;
-    payload: Record<string, unknown>; previous_hash: string; hash: string;
-  }): AuditRecord {
+  private map(row: AuditRow): AuditRecord {
     return {
       sequence: toNumber(row.sequence),
       timestamp: toNumber(row.ts),
@@ -592,14 +659,14 @@ export class PgAuditRepository implements AuditRepository {
   }
 
   async head(): Promise<AuditRecord | null> {
-    const { rows } = await this.pool.query(
+    const { rows } = await this.pool.query<AuditRow>(
       'SELECT * FROM trading.audit_record ORDER BY sequence DESC LIMIT 1',
     );
     return rows[0] ? this.map(rows[0]) : null;
   }
 
   async byCorrelation(correlationId: string): Promise<AuditRecord[]> {
-    const { rows } = await this.pool.query(
+    const { rows } = await this.pool.query<AuditRow>(
       'SELECT * FROM trading.audit_record WHERE correlation_id = $1 ORDER BY sequence',
       [correlationId],
     );
@@ -607,7 +674,7 @@ export class PgAuditRepository implements AuditRepository {
   }
 
   async byType(type: AuditEventType, limit: number): Promise<AuditRecord[]> {
-    const { rows } = await this.pool.query(
+    const { rows } = await this.pool.query<AuditRow>(
       'SELECT * FROM trading.audit_record WHERE type = $1 ORDER BY sequence DESC LIMIT $2',
       [type, limit],
     );
@@ -615,7 +682,7 @@ export class PgAuditRepository implements AuditRepository {
   }
 
   async recent(limit: number): Promise<AuditRecord[]> {
-    const { rows } = await this.pool.query(
+    const { rows } = await this.pool.query<AuditRow>(
       'SELECT * FROM trading.audit_record ORDER BY sequence DESC LIMIT $1', [limit],
     );
     return rows.map((r) => this.map(r));
@@ -659,10 +726,7 @@ export class PgCandleRepository implements CandleRepository {
     return rowCount ?? 0;
   }
 
-  private map(row: {
-    symbol: string; interval: Interval; ts: string;
-    open: string; high: string; low: string; close: string; volume: string;
-  }): Candle {
+  private map(row: CandleRow): Candle {
     return {
       symbol: row.symbol,
       interval: row.interval,
@@ -676,7 +740,7 @@ export class PgCandleRepository implements CandleRepository {
   }
 
   async range(symbol: string, interval: Interval, from: Timestamp, to: Timestamp): Promise<Candle[]> {
-    const { rows } = await this.pool.query(
+    const { rows } = await this.pool.query<CandleRow>(
       `SELECT * FROM trading.candle
         WHERE symbol = $1 AND interval = $2 AND ts BETWEEN $3 AND $4
         ORDER BY ts`,
@@ -686,7 +750,7 @@ export class PgCandleRepository implements CandleRepository {
   }
 
   async latest(symbol: string, interval: Interval, limit: number): Promise<Candle[]> {
-    const { rows } = await this.pool.query(
+    const { rows } = await this.pool.query<CandleRow>(
       `SELECT * FROM (
          SELECT * FROM trading.candle
           WHERE symbol = $1 AND interval = $2
@@ -725,10 +789,7 @@ export class PgModelRepository implements ModelRepository {
     );
   }
 
-  private map(row: {
-    id: string; version: string; feature_names: string[]; weights: number[];
-    bias: number; metrics: ValidationMetrics | null; promoted: boolean; registered_at: string;
-  }): StoredModel {
+  private map(row: ModelRow): StoredModel {
     return {
       id: row.id,
       version: row.version,
@@ -742,14 +803,14 @@ export class PgModelRepository implements ModelRepository {
   }
 
   async find(id: string, version: string): Promise<StoredModel | null> {
-    const { rows } = await this.pool.query(
+    const { rows } = await this.pool.query<ModelRow>(
       'SELECT * FROM trading.model WHERE id = $1 AND version = $2', [id, version],
     );
     return rows[0] ? this.map(rows[0]) : null;
   }
 
   async promoted(): Promise<StoredModel | null> {
-    const { rows } = await this.pool.query('SELECT * FROM trading.model WHERE promoted LIMIT 1');
+    const { rows } = await this.pool.query<ModelRow>('SELECT * FROM trading.model WHERE promoted LIMIT 1');
     return rows[0] ? this.map(rows[0]) : null;
   }
 
@@ -783,7 +844,7 @@ export class PgModelRepository implements ModelRepository {
   }
 
   async all(): Promise<StoredModel[]> {
-    const { rows } = await this.pool.query('SELECT * FROM trading.model ORDER BY registered_at DESC');
+    const { rows } = await this.pool.query<ModelRow>('SELECT * FROM trading.model ORDER BY registered_at DESC');
     return rows.map((r) => this.map(r));
   }
 }

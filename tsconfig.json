@@ -19,6 +19,9 @@
     "noEmit": true,
     "types": ["node", "jest"]
   },
-  "include": ["src/**/*.ts", "__tests__/**/*.ts", "scripts/**/*.ts"],
+  // `api/` is the Vercel entry point — production code that was outside every
+  // include here, so nothing typechecked it and a break in it would only have
+  // surfaced as a 500 from a deployed function.
+  "include": ["src/**/*.ts", "__tests__/**/*.ts", "scripts/**/*.ts", "api/**/*.ts"],
   "exclude": ["node_modules", "dist"]
 }

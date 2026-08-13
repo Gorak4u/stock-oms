@@ -17,7 +17,6 @@ import type {
   Fill,
   Interval,
   Order,
-  OrderStatus,
   Position,
   Timestamp,
 } from '../domain/types';

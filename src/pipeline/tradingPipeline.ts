@@ -378,7 +378,7 @@ export class TradingPipeline {
   }
 
   /** Builds the order for a signal, or `null` when it sizes to nothing. */
-  private buildRequest(signal: Signal, symbol: string, now: Timestamp): OrderRequest | null {
+  private buildRequest(signal: Signal, symbol: string, _now: Timestamp): OrderRequest | null {
     const portfolio = this.config.portfolio;
     const position = portfolio.getPosition(symbol);
     const heldQuantity = position?.quantity ?? 0;
@@ -446,7 +446,7 @@ export class TradingPipeline {
     if (cached !== undefined) return cached;
 
     const prepared = this.config.strategy.prepare(candles);
-    this.preparedCache.set(key, prepared as object);
+    this.preparedCache.set(key, prepared);
     return prepared;
   }
 }

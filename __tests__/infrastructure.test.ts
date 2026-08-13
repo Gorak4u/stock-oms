@@ -1,6 +1,6 @@
 import Redis from 'ioredis';
 import { execFileSync } from 'node:child_process';
-import { fromRupees, type Paise } from '../src/domain/money';
+import { fromRupees } from '../src/domain/money';
 import type { OrderRequest } from '../src/domain/types';
 import { BrokerError, BrokerUncertainError } from '../src/execution/broker';
 import { mapKiteStatus, ZerodhaBroker } from '../src/execution/zerodhaBroker';
@@ -78,7 +78,7 @@ describe('ZerodhaBroker — submission', () => {
   it('sends the idempotency key as the Kite tag so a lost ack can be recovered', async () => {
     let sentBody = '';
     const b = broker(async (_url, init) => {
-      sentBody = String(init?.body ?? '');
+      sentBody = typeof init?.body === 'string' ? init.body : '';
       return jsonResponse({ status: 'success', data: { order_id: '1' } });
     });
 
@@ -91,7 +91,7 @@ describe('ZerodhaBroker — submission', () => {
   it('translates stop order types to Kite SL / SL-M', async () => {
     let body = '';
     const b = broker(async (_url, init) => {
-      body = String(init?.body ?? '');
+      body = typeof init?.body === 'string' ? init.body : '';
       return jsonResponse({ status: 'success', data: { order_id: '1' } });
     });
 

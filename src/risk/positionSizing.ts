@@ -147,9 +147,9 @@ export function trailStop(
   direction: 'LONG' | 'SHORT',
 ): Paise {
   if (direction === 'LONG') {
-    return (candidateStop > currentStop ? candidateStop : currentStop) as Paise;
+    return candidateStop > currentStop ? candidateStop : currentStop;
   }
-  return (candidateStop < currentStop ? candidateStop : currentStop) as Paise;
+  return candidateStop < currentStop ? candidateStop : currentStop;
 }
 
 /** True when price has reached or passed the stop and the position must be closed. */

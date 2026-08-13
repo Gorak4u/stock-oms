@@ -25,7 +25,6 @@ import type {
   OrderRequest,
   OrderStatus,
   ProductType,
-  Side,
   Timestamp,
 } from '../domain/types';
 import { fromPaise, fromRupees, toRupees, type Paise } from '../domain/money';
@@ -358,7 +357,7 @@ export class ZerodhaBroker implements BrokerConnector {
       id: kite.order_id,
       request: {
         symbol,
-        side: kite.transaction_type as Side,
+        side: kite.transaction_type,
         quantity: kite.quantity,
         orderType: kite.order_type === 'SL' ? 'STOP_LIMIT' : kite.order_type === 'SL-M' ? 'STOP' : (kite.order_type as 'MARKET' | 'LIMIT'),
         product: kite.product as ProductType,
@@ -385,7 +384,7 @@ export class ZerodhaBroker implements BrokerConnector {
       .map((trade): Fill => ({
         orderId: trade.order_id,
         symbol: `${trade.exchange}:${trade.tradingsymbol}`,
-        side: trade.transaction_type as Side,
+        side: trade.transaction_type,
         quantity: trade.quantity,
         price: fromRupees(trade.average_price),
         timestamp: Date.parse(trade.fill_timestamp) || Date.now(),

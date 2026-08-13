@@ -1,4 +1,4 @@
-import { fromRupees, type Paise } from '../src/domain/money';
+import { fromRupees } from '../src/domain/money';
 import type { ClosedTrade } from '../src/execution/portfolio';
 import {
   computeDrawdown,

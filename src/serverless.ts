@@ -37,7 +37,7 @@ import { KiteSession } from './execution/kiteSession';
 import type { BrokerConnector } from './execution/broker';
 import { Reconciler } from './monitoring/reconciliation';
 import { AlertManager, HealthMonitor, MetricsRegistry } from './monitoring/metrics';
-import { MarketCalendar, NSE_HOLIDAYS_2026 } from './marketdata/calendar';
+import { buildCalendar, toIstDate } from './marketdata/calendar';
 import { KiteHistoricalProvider } from './marketdata/kiteHistorical';
 import { MarketDataIngestor, marketDataAge } from './marketdata/ingestion';
 import type { MarketDataProvider } from './marketdata/provider';
@@ -176,13 +176,29 @@ async function build(): Promise<Assembled> {
     alerts,
     limits: buildLimits(),
     openingCash: fromRupees(optionalNumber('OPENING_CASH', 1_000_000)),
-    calendar: new MarketCalendar({ holidays: NSE_HOLIDAYS_2026 }),
+    calendar: buildCalendar(process.env.NSE_HOLIDAYS),
     strategyKind: (process.env.STRATEGY as StrategyKind | undefined) ?? 'trend',
     symbols,
   });
 
   // Rebuilds the portfolio from fills and the risk state from its snapshot.
   await service.start();
+
+  // See the same check in main.ts: an uncovered year reads as a permanently
+  // closed market. Raised here on every cold start, which under this deployment
+  // is the only startup there is.
+  const today = toIstDate(Date.now());
+  if (!service.calendar.isCovered(today)) {
+    const covered = service.calendar.coveredYears?.join(', ') ?? 'none';
+    void alerts.dispatch({
+      severity: 'critical',
+      title: 'Trading calendar is out of date',
+      detail:
+        `The holiday list covers ${covered}, not ${today.slice(0, 4)}. Every session reads as ` +
+        'closed and no orders will be placed. Set NSE_HOLIDAYS to this year\'s NSE circular.',
+      at: Date.now(),
+    });
+  }
 
   let provider: MarketDataProvider | null = null;
   if (kiteSession && brokerMode === 'zerodha') {
@@ -212,6 +228,17 @@ async function build(): Promise<Assembled> {
   health.register('database', async () => {
     await database.pool.query('SELECT 1');
     return { status: 'healthy', detail: 'reachable' };
+  });
+
+  // See main.ts: an uncovered year means every session reads as closed.
+  health.register('calendar', async () => {
+    const date = toIstDate(Date.now());
+    return service.calendar.isCovered(date)
+      ? { status: 'healthy', detail: `holidays cover ${service.calendar.coveredYears?.join(', ') ?? 'every year'}` }
+      : {
+          status: 'unhealthy',
+          detail: `no holiday list for ${date.slice(0, 4)} — set NSE_HOLIDAYS; trading is disabled`,
+        };
   });
 
   health.register('broker', async () => {

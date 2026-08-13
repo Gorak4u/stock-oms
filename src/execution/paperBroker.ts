@@ -19,7 +19,7 @@
  */
 
 import type { Fill, Order, OrderRequest, Timestamp } from '../domain/types';
-import { fromPaise, mulRate, roundToTick, type Paise } from '../domain/money';
+import { fromPaise, mulRate, neg, roundToTick, type Paise } from '../domain/money';
 import { computeCosts, DEFAULT_COST_SCHEDULE, type CostSchedule } from './costs';
 import { BrokerError, type BrokerConnector, type BrokerOrderAck } from './broker';
 
@@ -229,7 +229,7 @@ export class PaperBroker implements BrokerConnector {
       };
 
       this.cash = fromPaise(
-        this.cash + (request.side === 'BUY' ? -turnover : turnover) - costs.total,
+        this.cash + (request.side === 'BUY' ? neg(turnover) : turnover) - costs.total,
       );
 
       if (updated.status === 'FILLED' || request.timeInForce === 'IOC') {

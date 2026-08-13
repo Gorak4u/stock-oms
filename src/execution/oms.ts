@@ -196,7 +196,7 @@ export class OrderManager {
     this.audit?.append('ORDER_STAGED', correlationId, { orderId, request }, now);
 
     let attempt = 0;
-    // eslint-disable-next-line no-constant-condition
+
     while (true) {
       try {
         this.audit?.append(

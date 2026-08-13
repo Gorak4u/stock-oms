@@ -1,9 +1,11 @@
 import { fromRupees, type Paise } from '../src/domain/money';
 import type { Candle, Tick } from '../src/domain/types';
 import {
+  buildCalendar,
   fromIst,
   MarketCalendar,
   NSE_HOLIDAYS_2026,
+  parseHolidays,
   toIstDate,
   toIstMinuteOfDay,
 } from '../src/marketdata/calendar';
@@ -92,6 +94,81 @@ describe('MarketCalendar', () => {
     expect(
       () => new MarketCalendar({ holidays: [], sessionOpenMinute: 900, sessionCloseMinute: 500 }),
     ).toThrow();
+  });
+});
+
+describe('MarketCalendar — holiday coverage', () => {
+  it('treats coverage as unbounded when no years are declared', () => {
+    // `holidays: []` describes a market with no holidays, not one nobody has
+    // configured. Backtests over arbitrary history depend on this.
+    const permissive = new MarketCalendar({ holidays: [] });
+
+    expect(permissive.coveredYears).toBeNull();
+    expect(permissive.isCovered('1998-06-15')).toBe(true);
+    expect(permissive.isMarketOpen(fromIst('2031-03-03', 12 * 60))).toBe(true);
+  });
+
+  it('refuses to open a session in a year the holiday list does not cover', () => {
+    const bounded = new MarketCalendar({ holidays: ['2026-01-26'], coveredYears: [2026] });
+
+    expect(bounded.isCovered('2026-03-02')).toBe(true);
+    expect(bounded.isMarketOpen(fromIst('2026-03-02', 12 * 60))).toBe(true);
+
+    // 2027-03-01 is an ordinary Monday. Without a holiday list for that year
+    // the calendar cannot know it is not Republic Day, so it reports the market
+    // closed rather than assuming it open.
+    expect(bounded.isCovered('2027-03-01')).toBe(false);
+    expect(bounded.sessionFor('2027-03-01')).toBeNull();
+    expect(bounded.isMarketOpen(fromIst('2027-03-01', 12 * 60))).toBe(false);
+    expect(bounded.minutesToClose(fromIst('2027-03-01', 12 * 60))).toBe(0);
+  });
+});
+
+describe('parseHolidays', () => {
+  it('accepts a comma- or whitespace-separated circular, sorted and de-duplicated', () => {
+    expect(parseHolidays('2027-01-26, 2027-08-15\n2027-01-26')).toEqual([
+      '2027-01-26',
+      '2027-08-15',
+    ]);
+  });
+
+  it('returns nothing for an empty list', () => {
+    expect(parseHolidays('   ')).toEqual([]);
+  });
+
+  it.each(['2027-1-26', '26-01-2027', 'republic day', '2027-13-01'])(
+    'rejects %s rather than silently dropping it',
+    (bad) => {
+      // A dropped date makes the calendar wrong on exactly one day of the year,
+      // and the first sign of it would be orders rejected by a closed exchange.
+      expect(() => parseHolidays(bad)).toThrow();
+    },
+  );
+});
+
+describe('buildCalendar', () => {
+  it('derives coverage from the built-in list, so it expires with it', () => {
+    const built = buildCalendar();
+
+    expect(built.coveredYears).toEqual([2026]);
+    expect(built.isCovered('2026-07-01')).toBe(true);
+    expect(built.isCovered('2027-07-01')).toBe(false);
+  });
+
+  it('replaces the built-in list rather than merging into it', () => {
+    // Merging would let an operator entering next year's circular silently
+    // inherit a stale set of dates alongside it.
+    const built = buildCalendar('2027-01-26, 2027-08-15');
+
+    expect(built.coveredYears).toEqual([2027]);
+    expect(built.isHoliday('2027-01-26')).toBe(true);
+    expect(built.isHoliday('2026-01-26')).toBe(false);
+    expect(built.isCovered('2026-06-01')).toBe(false);
+  });
+
+  it('covers several years when the list spans them', () => {
+    const built = buildCalendar('2026-01-26 2027-01-26');
+    expect(built.coveredYears).toEqual([2026, 2027]);
   });
 });
 
@@ -190,7 +267,7 @@ describe('resample', () => {
 
   it('refuses to resample to a shorter or non-multiple interval', () => {
     const minutes = [candle(0, 100, 100, 100, 100, 1)];
-    expect(() => resample(minutes, '1m' as never)).not.toThrow();
+    expect(() => resample(minutes, '1m')).not.toThrow();
     expect(() => resample(resample(minutes, '5m'), '1m')).toThrow();
   });
 

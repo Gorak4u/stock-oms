@@ -19,7 +19,7 @@ import type { Repositories } from '../src/persistence/ports';
 import { TradingService } from '../src/runtime/tradingService';
 import { PaperBroker } from '../src/execution/paperBroker';
 import { ZERO_COST_SCHEDULE } from '../src/execution/costs';
-import { HealthMonitor, MetricsRegistry } from '../src/monitoring/metrics';
+import { HealthMonitor } from '../src/monitoring/metrics';
 import { MarketCalendar } from '../src/marketdata/calendar';
 import { announceUnavailable } from './support/infra';
 

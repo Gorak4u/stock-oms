@@ -16,7 +16,7 @@
  */
 
 import type { Position } from '../domain/types';
-import { abs, mulRate, ratio, sum, type Paise } from '../domain/money';
+import { abs, mulRate, neg, ratio, sum, type Paise } from '../domain/money';
 import {
   type AccountState,
   type RiskContext,
@@ -266,7 +266,7 @@ export class RiskEngine {
     if (account.dayPnl < 0 && abs(account.dayPnl) >= dailyLossLimit) {
       rejections.push({
         code: 'DAILY_LOSS_LIMIT',
-        detail: `day P&L ${account.dayPnl} breached limit ${-dailyLossLimit}`,
+        detail: `day P&L ${account.dayPnl} breached limit ${neg(dailyLossLimit)}`,
       });
     }
 
@@ -380,7 +380,7 @@ export class RiskEngine {
     if (account.dayPnl < 0 && abs(account.dayPnl) >= dailyLossLimit) {
       breaches.push({
         code: 'DAILY_LOSS_LIMIT',
-        detail: `day P&L ${account.dayPnl} breached ${-dailyLossLimit}`,
+        detail: `day P&L ${account.dayPnl} breached ${neg(dailyLossLimit)}`,
       });
     }
 

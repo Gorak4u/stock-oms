@@ -289,7 +289,7 @@
     <div style="text-align:right">
       <p class="eyebrow">Verify</p>
       <p style="margin:6px 0 0;font-size:12.5px;color:var(--ink-2)">
-        Same seed → same result, every time.
+        Your data, computed here. Nothing is uploaded.
       </p>
       <!--
         The other half of the same application. This page is self-contained
@@ -308,36 +308,20 @@
     <div class="panel">
       <div class="panel-head"><h2>Market data</h2></div>
       <div class="panel-body">
-        <div class="seg" role="group" aria-label="Data source">
-          <button type="button" id="src-synth" aria-pressed="true">Synthetic</button>
-          <button type="button" id="src-csv" aria-pressed="false">Your CSV</button>
-        </div>
-
-        <div id="synth-fields" style="margin-top:13px">
-          <div class="pair">
-            <label class="field"><span>Bars</span>
-              <input type="number" id="bars" value="1250" min="120" max="6000" step="10">
-            </label>
-            <label class="field"><span>Seed</span>
-              <input type="number" id="seed" value="42" min="1" max="999999">
-            </label>
-          </div>
-          <p class="hint">
-            A seeded generator, not <span class="code">Math.random</span> — the same seed always
-            reproduces the same series. 1250 bars ≈ five years of sessions.
-          </p>
-        </div>
-
-        <div id="csv-fields" hidden style="margin-top:13px">
+        <div id="csv-fields">
           <label class="field"><span>Paste OHLC CSV</span>
-            <textarea id="csv" placeholder="date,open,high,low,close,volume
-2024-01-01,2500.00,2540.00,2490.00,2532.10,1840000
-2024-01-02,2532.10,2559.00,2521.35,2548.75,1620000"></textarea>
+            <textarea id="csv" placeholder="date,open,high,low,close,volume"></textarea>
           </label>
           <p class="hint">
             Header row required; <span class="code">date, open, high, low, close</span> in any
             order, <span class="code">volume</span> optional. Rows failing candle validation are
-            reported, not silently dropped.
+            reported, not silently dropped. At least 120 bars — the slowest indicator needs
+            that much history before it produces a signal.
+          </p>
+          <p class="hint">
+            Your own market data is the only input. There is no generated series: a random walk
+            has none of the structure a strategy exists to exploit, so a result measured on one
+            says nothing about whether these parameters would have traded well.
           </p>
         </div>
       </div>
@@ -545,18 +529,6 @@
     return out;
   }
 
-  // ---- data source toggle --------------------------------------------------
-  var source = "synth";
-  function setSource(next) {
-    source = next;
-    $("src-synth").setAttribute("aria-pressed", String(next === "synth"));
-    $("src-csv").setAttribute("aria-pressed", String(next === "csv"));
-    $("synth-fields").hidden = next !== "synth";
-    $("csv-fields").hidden = next !== "csv";
-  }
-  $("src-synth").addEventListener("click", function () { setSource("synth"); });
-  $("src-csv").addEventListener("click", function () { setSource("csv"); });
-
   function setStatus(text, isError) {
     $("status-text").textContent = text;
     $("status").classList.toggle("is-error", !!isError);
@@ -564,25 +536,22 @@
 
   // ---- gather a run request ------------------------------------------------
   function buildRequest() {
-    var candles, note;
-
-    if (source === "csv") {
-      var parsed = TP.parseCsv($("csv").value || "");
-      if (parsed.candles.length < 120) {
-        var why = parsed.errors.length
-          ? parsed.errors.join(" ")
-          : "Need at least 120 valid rows to warm up the indicators; got " + parsed.candles.length + ".";
-        return { error: why };
-      }
-      candles = parsed.candles;
-      note = candles.length + " bars from your CSV" +
-        (parsed.skipped ? " (" + parsed.skipped + " rows rejected by validation)" : "");
-    } else {
-      var bars = Math.max(120, Math.min(6000, Number($("bars").value) || 1250));
-      var seed = Number($("seed").value) || 42;
-      candles = TP.syntheticSeries(bars, seed);
-      note = bars + " synthetic bars, seed " + seed;
+    var raw = $("csv").value || "";
+    if (!raw.trim()) {
+      return { error: "Paste an OHLC CSV to backtest. This console runs on your data only." };
     }
+
+    var parsed = TP.parseCsv(raw);
+    if (parsed.candles.length < 120) {
+      var why = parsed.errors.length
+        ? parsed.errors.join(" ")
+        : "Need at least 120 valid rows to warm up the indicators; got " + parsed.candles.length + ".";
+      return { error: why };
+    }
+
+    var candles = parsed.candles;
+    var note = candles.length + " bars from your CSV" +
+      (parsed.skipped ? " (" + parsed.skipped + " rows rejected by validation)" : "");
 
     return {
       note: note,

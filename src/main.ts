@@ -32,8 +32,10 @@ import type { BrokerConnector } from './execution/broker';
 import { Reconciler } from './monitoring/reconciliation';
 import { AlertManager, HealthMonitor, MetricsRegistry, METRICS } from './monitoring/metrics';
 import { AlertDelivery } from './monitoring/alertDelivery';
-import { MarketCalendar, NSE_HOLIDAYS_2026 } from './marketdata/calendar';
+import { buildCalendar, toIstDate } from './marketdata/calendar';
 import { KiteHistoricalProvider } from './marketdata/kiteHistorical';
+import { KiteTicker } from './marketdata/kiteTicker';
+import { LiveFeed } from './marketdata/liveFeed';
 import { MarketDataIngestor, marketDataAge } from './marketdata/ingestion';
 import type { MarketDataProvider } from './marketdata/provider';
 import { DEFAULT_RISK_LIMITS, type RiskLimits } from './risk/types';
@@ -167,19 +169,53 @@ export async function main(): Promise<void> {
     alerts,
     limits: buildLimits(),
     openingCash: fromRupees(optionalNumber('OPENING_CASH', 1_000_000)),
-    calendar: new MarketCalendar({ holidays: NSE_HOLIDAYS_2026 }),
+    calendar: buildCalendar(process.env.NSE_HOLIDAYS),
     strategyKind: (process.env.STRATEGY as StrategyKind | undefined) ?? 'trend',
     symbols,
   });
 
+  // The holiday list expires: it covers the years an operator has entered and
+  // no others. An uncovered year makes `sessionFor` return null for every date,
+  // so the loop would run all year deciding nothing — healthy, quiet, and
+  // completely inert. Announced at startup, while there is still time to set
+  // NSE_HOLIDAYS, rather than discovered from a flat P&L in January.
+  const today = toIstDate(Date.now());
+  if (!service.calendar.isCovered(today)) {
+    const covered = service.calendar.coveredYears?.join(', ') ?? 'none';
+    log('error', `holiday calendar does not cover ${today.slice(0, 4)} — trading is disabled`);
+    void alerts.dispatch({
+      severity: 'critical',
+      title: 'Trading calendar is out of date',
+      detail:
+        `The holiday list covers ${covered}, not ${today.slice(0, 4)}. Every session reads as ` +
+        'closed and no orders will be placed. Set NSE_HOLIDAYS to this year\'s NSE circular.',
+      at: Date.now(),
+    });
+  }
+
   // ---- leadership ----------------------------------------------------------
 
   let promoted = false;
+  /**
+   * Assigned further down, once the market data provider exists.
+   *
+   * Declared here because the leadership callbacks below own its lifecycle: the
+   * feed is a second connection to the broker and a second writer to the candle
+   * table, and only the process that is actually trading should hold either.
+   */
+  let liveFeed: LiveFeed | null = null;
+  /** Kept alongside the feed so the health check can ask when a frame last arrived. */
+  let liveTicker: KiteTicker | null = null;
+  let liveFeedSymbols = 0;
 
   const leader = new LeaderLock(database.pool, {
     retryIntervalMs: optionalNumber('LEADER_RETRY_MS', 15_000),
     onLost: (reason) => {
       metrics.setGauge(METRICS.isLeader, 0);
+      // Release the feed with the lock. Kite caps concurrent ticker
+      // connections, so a demoted process that kept streaming would deny the
+      // new leader the data it needs to trade on.
+      void liveFeed?.stop();
       void alerts.dispatch({
         severity: 'critical',
         title: 'Trading leadership lost',
@@ -189,6 +225,7 @@ export async function main(): Promise<void> {
     },
     onAcquired: () => {
       metrics.setGauge(METRICS.isLeader, 1);
+      liveFeed?.start();
       // Only announced when it happens *after* startup — being the leader from
       // the beginning is the ordinary case and needs no alert.
       if (!promoted) return;
@@ -245,6 +282,73 @@ export async function main(): Promise<void> {
     });
   }
 
+  // ---- live feed -----------------------------------------------------------
+
+  /**
+   * The streaming quote feed.
+   *
+   * The historical ingestor above cannot carry the current bar: Kite does not
+   * publish a bar until it has closed, and rate-limits the endpoint well below
+   * a feed. On daily bars that is invisible. On minute bars it means every
+   * decision is made against a bar the market has already moved past, so an
+   * intraday deployment needs this and a daily one does not.
+   *
+   * Disabled by default. Turning it on is a deliberate act, because it opens a
+   * second connection to the broker and a second writer to the `candle` table.
+   */
+  if (
+    optionalBoolean('LIVE_FEED', false) &&
+    marketDataProvider instanceof KiteHistoricalProvider &&
+    kiteSession &&
+    symbols.length > 0
+  ) {
+    const provider = marketDataProvider;
+    const session = kiteSession;
+
+    // Resolved once, from the instrument dump the provider already caches. A
+    // symbol that does not resolve is fatal to the feed for that symbol only —
+    // the rest still stream, and the trading loop still reads whatever the
+    // ingestor writes for the missing one.
+    const tokenToSymbol = new Map<number, string>();
+    for (const symbol of symbols) {
+      try {
+        tokenToSymbol.set(await provider.resolveToken(symbol), symbol);
+      } catch (error) {
+        log('warn', `no Kite instrument for ${symbol} — it will not stream`, {
+          detail: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    if (tokenToSymbol.size > 0) {
+      const ticker = new KiteTicker({
+        apiKey: required('KITE_API_KEY'),
+        accessToken: () => session.accessToken(),
+        symbolFor: (token) => tokenToSymbol.get(token),
+        ...(process.env.KITE_TICKER_URL ? { url: process.env.KITE_TICKER_URL } : {}),
+        heartbeatTimeoutMs: optionalNumber('TICKER_HEARTBEAT_MS', 10_000),
+      });
+
+      liveFeed = new LiveFeed({
+        ticker,
+        candles: repositories.candles,
+        calendar: service.calendar,
+        interval: barInterval,
+        metrics,
+        alerts,
+        flushIntervalMs: optionalNumber('LIVE_FEED_FLUSH_MS', 5_000),
+      });
+
+      ticker.subscribe([...tokenToSymbol.keys()]);
+      liveTicker = ticker;
+      liveFeedSymbols = tokenToSymbol.size;
+
+      log('info', 'live tick feed configured', {
+        symbols: tokenToSymbol.size, interval: barInterval,
+      });
+    }
+  }
+
   // ---- health --------------------------------------------------------------
 
   const health = new HealthMonitor();
@@ -261,6 +365,34 @@ export async function main(): Promise<void> {
       : { status: 'degraded', detail: `${broker.name} is not responding` };
   });
 
+  if (liveTicker) {
+    const ticker = liveTicker;
+    const symbolCount = liveFeedSymbols;
+    const staleTickMs = optionalNumber('TICKER_STALE_MS', 120_000);
+
+    // The check that matters is not "is the socket open" — it is "did a frame
+    // arrive". A connection that stays open and stops delivering is the exact
+    // failure the watchdog exists to survive, and it is invisible to anything
+    // that only inspects connection state.
+    health.register('market-feed', async () => {
+      const now = Date.now();
+      if (!leader.isLeader) {
+        return { status: 'healthy', detail: 'not leader; feed intentionally idle' };
+      }
+      if (!service.calendar.isMarketOpen(now)) {
+        return { status: 'healthy', detail: 'market closed' };
+      }
+      if (!ticker.isConnected) {
+        return { status: 'unhealthy', detail: 'ticker disconnected during a session' };
+      }
+
+      const age = now - ticker.lastFrameTimestamp;
+      return age > staleTickMs
+        ? { status: 'unhealthy', detail: `connected but no frames for ${Math.round(age / 1000)}s` }
+        : { status: 'healthy', detail: `streaming ${symbolCount} instrument(s)` };
+    });
+  }
+
   health.register('audit-chain', async () => {
     const broken = service.audit.verifyChain();
     return broken === null
@@ -273,6 +405,20 @@ export async function main(): Promise<void> {
       ? { status: 'healthy', detail: 'holds the trading lock' }
       : { status: 'degraded', detail: 'read-only; another instance is trading' },
   );
+
+  // Unhealthy rather than degraded: an uncovered year is not reduced capability,
+  // it is a process that will never trade again until someone changes the
+  // configuration. Checked per request rather than captured at startup so a
+  // container that stays up across new year reports it on 1 January.
+  health.register('calendar', async () => {
+    const date = toIstDate(Date.now());
+    return service.calendar.isCovered(date)
+      ? { status: 'healthy', detail: `holidays cover ${service.calendar.coveredYears?.join(', ') ?? 'every year'}` }
+      : {
+          status: 'unhealthy',
+          detail: `no holiday list for ${date.slice(0, 4)} — set NSE_HOLIDAYS; trading is disabled`,
+        };
+  });
 
   if (kiteSession) {
     const session = kiteSession;
@@ -421,6 +567,10 @@ export async function main(): Promise<void> {
     ingestTimer = setInterval(() => void pump(), intervalMs);
   }
 
+  // Started here rather than at construction because leadership is only settled
+  // by this point; `onAcquired` covers the case where it is won later.
+  if (liveFeed && leader.isLeader) liveFeed.start();
+
   runner.start();
 
   // ---- shutdown ------------------------------------------------------------
@@ -434,6 +584,12 @@ export async function main(): Promise<void> {
     log('info', `${signal} received — draining before close`);
 
     if (ingestTimer) clearInterval(ingestTimer);
+
+    // Stopped before the loop drains, so the bar in progress is written while
+    // the database connection is still open. The ticks behind it exist nowhere
+    // else, so a bar dropped here is a hole in the series that only the next
+    // historical sync would fill.
+    await liveFeed?.stop();
 
     // Wait for a tick already in flight. A tick can sit between "order
     // persisted as PENDING_NEW" and "broker acknowledged"; exiting there leaves

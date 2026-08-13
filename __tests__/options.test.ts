@@ -1,4 +1,4 @@
-import { fromRupees, toRupees, type Paise } from '../src/domain/money';
+import { fromRupees, toRupees, type Paise, neg } from '../src/domain/money';
 import {
   europeanLowerBound,
   greeks,
@@ -294,7 +294,7 @@ describe('bullCallSpread', () => {
 
   it('caps loss at the debit paid', () => {
     const risk = analyseStructure(spread, CONTEXT);
-    expect(risk.maxLoss).toBeCloseTo(-risk.netDebit, -2);
+    expect(risk.maxLoss).toBeCloseTo(neg(risk.netDebit), -2);
   });
 
   it('has exactly one break-even, between the strikes', () => {
@@ -319,7 +319,7 @@ describe('bearPutSpread', () => {
   it('is a debit with bounded profit and loss', () => {
     const risk = analyseStructure(spread, CONTEXT);
     expect(risk.netDebit).toBeGreaterThan(0);
-    expect(risk.maxLoss).toBeCloseTo(-risk.netDebit, -2);
+    expect(risk.maxLoss).toBeCloseTo(neg(risk.netDebit), -2);
     expect(Number.isFinite(risk.maxProfit)).toBe(true);
   });
 
@@ -334,7 +334,7 @@ describe('longStraddle', () => {
   it('loses the full debit if the underlying does not move', () => {
     const risk = analyseStructure(straddle, CONTEXT);
     const atExpiry = payoffAtExpiry(straddle, fromRupees(22_000)) - risk.netDebit;
-    expect(atExpiry).toBeCloseTo(-risk.netDebit, -2);
+    expect(atExpiry).toBeCloseTo(neg(risk.netDebit), -2);
   });
 
   it('has two break-evens straddling the strike', () => {

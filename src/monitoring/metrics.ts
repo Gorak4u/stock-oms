@@ -277,4 +277,10 @@ export const METRICS = {
   /** Epoch ms of the newest stored bar. Alert on `time() - this` to catch a stalled feed. */
   marketDataLastBar: 'trading_market_data_last_bar_timestamp',
   isLeader: 'trading_is_leader',
+  /** Live tick feed. A connected feed with zero ticks during a session is the failure to watch for. */
+  tickerTicks: 'trading_ticker_ticks_total',
+  tickerRejected: 'trading_ticker_ticks_rejected_total',
+  tickerReconnects: 'trading_ticker_reconnects_total',
+  tickerConnected: 'trading_ticker_connected',
+  tickerLastTick: 'trading_ticker_last_tick_timestamp',
 } as const;

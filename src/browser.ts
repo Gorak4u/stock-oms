@@ -20,8 +20,6 @@ import { VolatilityBreakoutStrategy } from './strategy/volatility';
 import type { Strategy } from './strategy/types';
 import { validateCandle } from './marketdata/validation';
 
-const DAY = 86_400_000;
-
 export type StrategyKey = 'trend' | 'meanReversion' | 'momentum' | 'volatility';
 
 export const STRATEGY_LABELS: Record<StrategyKey, string> = {
@@ -55,56 +53,6 @@ function buildStrategy(key: StrategyKey, params: Record<string, number>): Strate
         ...(params.squeezeLookback ? { squeezeLookback: params.squeezeLookback } : {}),
       });
   }
-}
-
-/**
- * Deterministic synthetic series.
- *
- * A seeded LCG, not `Math.random`, so the same seed always reproduces the same
- * series — otherwise nothing shown here could be checked against a rerun.
- */
-export function syntheticSeries(
-  length: number,
-  seed: number,
-  options: { startPrice?: number; volatility?: number; regimeStrength?: number } = {},
-): Candle[] {
-  const startPrice = options.startPrice ?? 1500;
-  const volatility = options.volatility ?? 0.025;
-  const regimeStrength = options.regimeStrength ?? 0.0012;
-
-  let state = Math.abs(Math.trunc(seed)) % 2147483647 || 42;
-  const next = (): number => {
-    state = (state * 1103515245 + 12345) % 2147483648;
-    return state / 2147483648;
-  };
-
-  const start = Date.parse('2021-01-01T00:00:00Z');
-  const candles: Candle[] = [];
-  let price = startPrice;
-
-  for (let i = 0; i < length; i += 1) {
-    const regime = Math.sin(i / 120) * regimeStrength;
-    const shock = (next() - 0.5) * volatility + regime;
-    const open = price;
-    const close = Math.max(1, open * (1 + shock));
-    const high = Math.max(open, close) * (1 + next() * 0.008);
-    const low = Math.min(open, close) * (1 - next() * 0.008);
-
-    candles.push({
-      symbol: 'SYNTH',
-      interval: '1d',
-      timestamp: start + i * DAY,
-      open: fromRupees(open),
-      high: fromRupees(high),
-      low: fromRupees(low),
-      close: fromRupees(close),
-      volume: 250_000 + Math.floor(next() * 100_000),
-    });
-
-    price = close;
-  }
-
-  return candles;
 }
 
 export interface ParsedCsv {
@@ -392,7 +340,7 @@ export async function runWalkForward(
   return {
     folds: report.folds.map((fold, index) => ({
       fold: index + 1,
-      params: Object.entries(fold.selectedParams as Record<string, number>)
+      params: Object.entries(fold.selectedParams)
         .map(([key, value]) => `${key}=${value}`)
         .join(' '),
       inSample: fold.trainMetrics.totalReturn,

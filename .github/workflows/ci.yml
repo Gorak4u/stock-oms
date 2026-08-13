@@ -20,7 +20,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  NODE_VERSION: '20'
+  # 22 is the active LTS. The floor in package.json stays at 20 — that is the
+  # oldest runtime the code supports, not the one CI has to prove it on.
+  NODE_VERSION: '22'
 
 jobs:
   test:
@@ -60,9 +62,9 @@ jobs:
       REQUIRE_INFRA: '1'
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -79,12 +81,23 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Lint
+        run: npm run lint
+
+      # The API serves the backtest console from dist/console.html, and one
+      # suite asserts that route returns a page rather than a 404. Without this
+      # the assertion tests nothing but whether a previous job left artefacts
+      # behind — which on a clean runner it never does, so the suite failed on
+      # every run while the code it covers was fine.
+      - name: Build the browser console
+        run: npm run build:console
+
       - name: Test
         run: npm test -- --coverage --ci
 
       - name: Upload coverage
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: coverage
           path: coverage/
@@ -96,9 +109,9 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -119,11 +132,16 @@ jobs:
 
       # The static-site build is what a CDN host runs; breaking it would only
       # surface as a failed deploy otherwise.
+      #
+      # The names asserted here are the ones build-static.js actually stages,
+      # which are the application's own routes: `/` is the dashboard and
+      # `/console` the backtest console. Asserting a public/dashboard.html that
+      # nothing has ever produced failed this job on every run.
       - name: Stage the static site
         run: |
           npm run build:static
           test -s public/index.html
-          test -s public/dashboard.html
+          test -s public/console.html
 
       # Guards the failure mode the asset copier exists to prevent: a container
       # that builds cleanly and then dies on its first migrate() call because
@@ -141,7 +159,7 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: docker/setup-buildx-action@v3
 
@@ -184,9 +202,9 @@ jobs:
           --health-retries 10
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -237,7 +255,7 @@ jobs:
 
       - name: Upload logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: smoke-logs
           path: app.log
