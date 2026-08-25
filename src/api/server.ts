@@ -28,6 +28,7 @@ import type { AutomationMode } from '../domain/types';
 import { toRupees } from '../domain/money';
 import type { TradingService } from '../runtime/tradingService';
 import type { Repositories } from '../persistence/ports';
+import type { PipelineOutcome } from '../pipeline/tradingPipeline';
 import { HealthMonitor, type MetricsRegistry } from '../monitoring/metrics';
 import { BacktestEngine } from '../backtest/engine';
 import { buildStrategy, type StrategyKind } from '../runtime/tradingService';
@@ -55,6 +56,17 @@ export interface ApiConfig {
   readonly rateLimitPerMinute?: number;
   /** Largest accepted request body. Backtest payloads are the biggest legitimate one. */
   readonly bodyLimitBytes?: number;
+  /**
+   * Current broker session state, for the dashboard to render.
+   *
+   * The Kite token expires around 07:30 IST daily and cannot be refreshed
+   * without a human visiting the login URL, so an operator needs to see whether
+   * one is needed and follow the link — not read it out of a critical alert in
+   * the container's log stream.
+   */
+  readonly brokerSession?: () => {
+    loginUrl: string; expiresAt: number | null; valid: boolean;
+  };
   /** Called when an operator supplies a fresh broker session token. */
   readonly onBrokerSession?: (input: {
     requestToken?: string; accessToken?: string; actor: string;
@@ -75,6 +87,24 @@ export interface ApiConfig {
    * lets an operator force a tick by hand while debugging.
    */
   readonly cronSecret?: string;
+  /**
+   * Gate on whether this process may act on the account.
+   *
+   * Runs `fn` only when this instance is the one allowed to place orders, and
+   * resolves to `null` when it is not. Reads and state changes are safe on any
+   * instance; sending an order is not — two processes acting on one account
+   * place two orders for one intent, and the idempotency key does not save you,
+   * because each derives its own key from its own decision.
+   *
+   * The two deployments express that guarantee differently, which is why this
+   * is a function rather than a boolean: the always-on process holds a Postgres
+   * advisory lock for its lifetime, while a serverless invocation takes a job
+   * lease for the duration of the work. Both fit behind this.
+   *
+   * Optional: absent, the action runs unguarded — right for a test or a
+   * single-instance run, wrong for anything else.
+   */
+  readonly withTradingGuard?: <T>(fn: () => Promise<T>) => Promise<T | null>;
 }
 
 /** Constant-time comparison; a plain `===` on a secret leaks its length by timing. */
@@ -204,7 +234,15 @@ async function assembleServer(config: ApiConfig): Promise<FastifyInstance> {
     // authenticated `/api/*` routes below, and the console computes everything
     // client-side from data you give it. Serving them discloses no more than
     // serving a login form does.
-    if (path === '/health' || path === '/metrics' || path === '/' || path === '/console') return;
+    // `/favicon.ico`: the browser asks for it unprompted on every page load,
+    // and a 401 for a request nobody made is noise in the log someone reads
+    // when a real authentication problem is being investigated.
+    if (
+      path === '/health' || path === '/metrics' || path === '/' ||
+      path === '/console' || path === '/favicon.ico'
+    ) {
+      return;
+    }
 
     // Mutating routes and the websocket authenticate themselves, the latter
     // because it also accepts a query token.
@@ -280,6 +318,16 @@ async function assembleServer(config: ApiConfig): Promise<FastifyInstance> {
 
   // ---- health & metrics --------------------------------------------------
 
+  /**
+   * Answers the browser's automatic favicon request.
+   *
+   * Without this every dashboard load logs a 401 — the auth hook refusing a
+   * request no one made deliberately. That is noise in exactly the log someone
+   * reads when investigating a real authentication problem. 204 with no body
+   * discloses nothing.
+   */
+  app.get('/favicon.ico', async (_request, reply) => reply.code(204).send());
+
   app.get('/health', async (_request, reply) => {
     const report = await health.run();
     // 503 on unhealthy so a load balancer can act on it without parsing JSON.
@@ -309,6 +357,100 @@ async function assembleServer(config: ApiConfig): Promise<FastifyInstance> {
       unrealisedPnlRupees: toRupees(p.unrealisedPnl),
     })),
   }));
+
+  /**
+   * Closes one position at the market, now, on an operator's say-so.
+   *
+   * This is the only exit an operator can initiate. Everything else that closes
+   * a position is a decision the system made: a strategy emitting FLAT at a bar
+   * close, or the square-off ahead of the session end. Neither is available
+   * when a human wants out *now* — and the emergency stop is not an exit
+   * either, because it blocks orders that open exposure and deliberately leaves
+   * open positions alone.
+   *
+   * Deliberately not staged for approval, even in APPROVAL mode. Staging exists
+   * so a human sees an order the system proposed before it goes; an order the
+   * human just asked for has already had that review, and queuing it for their
+   * own second approval would only add delay to the one action whose whole
+   * point is immediacy.
+   *
+   * It still goes through the OMS rather than around it, so the order is
+   * persisted `PENDING_NEW` before the broker call, carries an idempotency key,
+   * and reconciles like any other. Risk cannot block it: a pure reduction
+   * bypasses the size controls by construction, which is the rule that a
+   * control must never trap an account in a losing position.
+   */
+  app.post('/api/positions/:symbol/flatten', async (request, reply) => {
+    if (!requireAuth(request, reply)) return;
+
+    const { symbol } = request.params as { symbol: string };
+    const actor = actorOf(request);
+
+    const act = async (): Promise<{ status: number; body: Record<string, unknown> }> => {
+      const position = service.portfolio.getPosition(symbol);
+      if (!position || position.quantity === 0) {
+        return { status: 409, body: { error: `no open position in ${symbol}` } };
+      }
+
+      // A second click before the first exit fills would send a second order
+      // for the same position: the key is derived from the intent, and an
+      // operator clicking twice has produced two intents a millisecond apart.
+      // Whether the first one filled is the broker's answer to give, so refuse
+      // while anything is still working on this symbol.
+      const working = await repositories.orders.findOpen();
+      if (working.some((order) => order.request.symbol === symbol)) {
+        return {
+          status: 409,
+          body: { error: `an order is already working on ${symbol} — wait for it to settle` },
+        };
+      }
+
+      const quantity = Math.abs(position.quantity);
+      const side = position.quantity > 0 ? 'SELL' : 'BUY';
+      const correlationId = `manual-exit-${symbol}-${Date.now()}`;
+
+      // Recorded before the order is sent, and with the actor: "who flattened
+      // this, and when" is asked after an incident, and an audit written only
+      // on success would be missing exactly when it is most wanted.
+      service.audit.append(
+        'MANUAL_EXIT',
+        correlationId,
+        { symbol, side, quantity, actor },
+        Date.now(),
+      );
+
+      const order = service.oms.buildRequest(
+        { strategyId: 'manual-exit', symbol, side, quantity, decisionBar: Date.now() },
+        { orderType: 'MARKET', product: 'MIS', timeInForce: 'DAY' },
+      );
+
+      const result = await service.submitExit(order, correlationId);
+      if (!result.submitted) {
+        return {
+          status: 502,
+          body: { error: result.refusedReason ?? 'the broker refused the order' },
+        };
+      }
+
+      return {
+        status: 200,
+        body: { flattened: symbol, side, quantity, orderId: result.order.id },
+      };
+    };
+
+    const outcome = config.withTradingGuard ? await config.withTradingGuard(act) : await act();
+
+    // A follower must not place orders. Saying so plainly beats a generic
+    // failure: the operator's next move is to open the leader's dashboard, and
+    // nothing else in the response would tell them that.
+    if (outcome === null) {
+      return reply.code(409).send({
+        error: 'this instance does not hold the trading lock — use the instance that does',
+      });
+    }
+
+    return reply.code(outcome.status).send(outcome.body);
+  });
 
   app.get('/api/orders', async (request) => {
     const { limit = '50' } = request.query as { limit?: string };
@@ -388,11 +530,42 @@ async function assembleServer(config: ApiConfig): Promise<FastifyInstance> {
     })),
   }));
 
+  /**
+   * Puts a refused approval into words.
+   *
+   * The outcome alone is machine-readable and useless to the person who just
+   * clicked Approve: risk is re-run at approval time, so a refusal is normal
+   * and the operator's next question is always "why". Returning only the kind
+   * left the dashboard showing `HTTP 409` — the one thing they already knew.
+   */
+  function refusalReason(outcome: PipelineOutcome): string {
+    switch (outcome.kind) {
+      case 'NO_SIGNAL':
+        return 'no such staged order — it may have been approved, rejected or superseded already';
+      case 'RISK_REJECTED':
+        return `risk refused it on re-check: ${outcome.reasons.join('; ')}`;
+      case 'SIZED_TO_ZERO':
+        return `sized to zero on re-check: ${outcome.reason}`;
+      case 'MODEL_VETOED':
+        return `the model vetoed it: ${outcome.reason}`;
+      case 'SUBMIT_REFUSED':
+        return `the broker refused it: ${outcome.reason}`;
+      default:
+        return `not submitted (${outcome.kind})`;
+    }
+  }
+
   app.post('/api/approvals/:key/approve', async (request, reply) => {
     if (!requireAuth(request, reply)) return;
     const { key } = request.params as { key: string };
     const outcome = await service.pipeline.approve(key, Date.now());
-    return reply.code(outcome.kind === 'SUBMITTED' ? 200 : 409).send({ outcome });
+
+    if (outcome.kind === 'SUBMITTED') return reply.code(200).send({ outcome });
+
+    // Risk is deliberately re-run at approval time, because a verdict from
+    // minutes ago may have been overtaken by a drawdown. A refusal here is an
+    // ordinary outcome, not a fault, so it carries the explanation with it.
+    return reply.code(409).send({ outcome, error: refusalReason(outcome) });
   });
 
   app.post('/api/approvals/:key/reject', async (request, reply) => {
@@ -462,6 +635,13 @@ async function assembleServer(config: ApiConfig): Promise<FastifyInstance> {
    * without a redeploy or a restart — the alternative was baking the token
    * into the environment, which meant a container restart every morning.
    */
+  app.get('/api/broker/session', async () => {
+    if (!config.brokerSession) {
+      return { configured: false, loginUrl: null, expiresAt: null, valid: true };
+    }
+    return { configured: true, ...config.brokerSession() };
+  });
+
   app.post('/api/broker/session', async (request, reply) => {
     if (!requireAuth(request, reply)) return;
 

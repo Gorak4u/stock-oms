@@ -298,6 +298,160 @@ describe('API', () => {
     });
   });
 
+  // ---- manual exit --------------------------------------------------------
+
+  describe('POST /api/positions/:symbol/flatten', () => {
+    /**
+     * The only exit an operator can start.
+     *
+     * Everything else that closes a position is the system's decision — a
+     * strategy emitting FLAT at a bar close, or the square-off before the
+     * session ends — and neither is available when a human wants out now. The
+     * emergency stop is not an exit either: it blocks orders that open
+     * exposure and leaves open positions alone by design.
+     */
+    async function openPosition(symbol = 'NSE:TEST'): Promise<void> {
+      await repositories.orders.insert({
+        id: `ord-${symbol}`,
+        request: {
+          symbol, side: 'BUY', quantity: 100, orderType: 'MARKET',
+          product: 'MIS', timeInForce: 'DAY', strategyId: 'seed',
+          idempotencyKey: `seed-${symbol}`,
+        },
+        status: 'FILLED', filledQuantity: 100, createdAt: 1000, updatedAt: 1000,
+      });
+      await service.applyFill({
+        orderId: `ord-${symbol}`, symbol, side: 'BUY', quantity: 100,
+        price: fromRupees(1000), timestamp: 1000, commission: 0 as Paise,
+      });
+    }
+
+    const flatten = (symbol: string, headers: Record<string, string> = auth) =>
+      app.inject({ method: 'POST', url: `/api/positions/${encodeURIComponent(symbol)}/flatten`, headers });
+
+    interface OrderRow { request: { strategyId: string; side: string; quantity: number; orderType: string } }
+
+    const ordersFrom = async (instance = app): Promise<OrderRow[]> =>
+      (await instance.inject({ method: 'GET', url: '/api/orders', headers: auth }))
+        .json<{ orders: OrderRow[] }>().orders;
+
+    it('needs a token', async () => {
+      expect((await flatten('NSE:TEST', {})).statusCode).toBe(401);
+    });
+
+    it('sends a market order on the opposite side for the whole position', async () => {
+      await openPosition();
+
+      const response = await flatten('NSE:TEST');
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({
+        flattened: 'NSE:TEST', side: 'SELL', quantity: 100,
+      });
+
+      const submitted = (await ordersFrom())
+        .find((o) => o.request.strategyId === 'manual-exit');
+      expect(submitted?.request.side).toBe('SELL');
+      expect(submitted?.request.quantity).toBe(100);
+      expect(submitted?.request.orderType).toBe('MARKET');
+    });
+
+    it('buys to cover a short', async () => {
+      await repositories.orders.insert({
+        id: 'ord-short',
+        request: {
+          symbol: 'NSE:SHORT', side: 'SELL', quantity: 40, orderType: 'MARKET',
+          product: 'MIS', timeInForce: 'DAY', strategyId: 'seed', idempotencyKey: 'seed-short',
+        },
+        status: 'FILLED', filledQuantity: 40, createdAt: 1000, updatedAt: 1000,
+      });
+      await service.applyFill({
+        orderId: 'ord-short', symbol: 'NSE:SHORT', side: 'SELL', quantity: 40,
+        price: fromRupees(500), timestamp: 1000, commission: 0 as Paise,
+      });
+
+      expect((await flatten('NSE:SHORT')).json()).toMatchObject({ side: 'BUY', quantity: 40 });
+    });
+
+    it('refuses when there is no position to close', async () => {
+      const response = await flatten('NSE:NOTHING');
+      expect(response.statusCode).toBe(409);
+      expect(response.json().error).toMatch(/no open position/);
+    });
+
+    it('refuses a second exit while the first is still working', async () => {
+      // Two clicks a millisecond apart are two intents, so they derive two
+      // idempotency keys and would place two orders for one position. Whether
+      // the first filled is the broker's answer to give, not this route's.
+      await openPosition();
+      await repositories.orders.insert({
+        id: 'ord-working',
+        request: {
+          symbol: 'NSE:TEST', side: 'SELL', quantity: 100, orderType: 'MARKET',
+          product: 'MIS', timeInForce: 'DAY', strategyId: 'manual-exit',
+          idempotencyKey: 'working-key',
+        },
+        status: 'PENDING_NEW', filledQuantity: 0, createdAt: 2000, updatedAt: 2000,
+      });
+
+      const response = await flatten('NSE:TEST');
+      expect(response.statusCode).toBe(409);
+      expect(response.json().error).toMatch(/already working/);
+    });
+
+    it('is not staged for approval, even in APPROVAL mode', async () => {
+      // Staging exists so a human reviews an order the system proposed. An
+      // order the human just asked for has had that review; queuing it for
+      // their own second approval would only delay the one action whose point
+      // is immediacy.
+      await openPosition();
+      await service.setMode('APPROVAL', 'test');
+
+      try {
+        expect((await flatten('NSE:TEST')).statusCode).toBe(200);
+        expect((await get('/api/approvals')).json().approvals).toHaveLength(0);
+      } finally {
+        await service.setMode('MANUAL', 'test');
+      }
+    });
+
+    it('records who did it, before the order is sent', async () => {
+      await openPosition();
+      await flatten('NSE:TEST');
+
+      const { records } = (await get('/api/audit'))
+        .json<{ records: { type: string; payload: Record<string, unknown> }[] }>();
+      const record = records.find((r) => r.type === 'MANUAL_EXIT');
+      expect(record).toBeDefined();
+      expect(record?.payload).toMatchObject({ symbol: 'NSE:TEST', side: 'SELL', quantity: 100 });
+    });
+
+    it('refuses on an instance that does not hold the trading lock', async () => {
+      // A follower serves this dashboard too. Without the gate, an operator on
+      // the wrong tab sends a second exit for one position.
+      const follower = await buildServer({
+        service, repositories, metrics: service.metrics,
+        health: new HealthMonitor(), authToken: TOKEN,
+        withTradingGuard: async () => null,
+      });
+      await follower.ready();
+
+      try {
+        await openPosition();
+        const response = await follower.inject({
+          method: 'POST', url: '/api/positions/NSE:TEST/flatten', headers: auth,
+        });
+        expect(response.statusCode).toBe(409);
+        expect(response.json().error).toMatch(/does not hold the trading lock/);
+
+        // And nothing was sent.
+        const orders = await ordersFrom();
+        expect(orders.some((o) => o.request.strategyId === 'manual-exit')).toBe(false);
+      } finally {
+        await follower.close();
+      }
+    });
+  });
+
   // ---- positions, trades, equity -----------------------------------------
 
   describe('portfolio routes', () => {
@@ -833,6 +987,21 @@ describe('API', () => {
         method: 'POST', url: '/api/approvals/nonexistent/approve', headers: auth,
       });
       expect(response.statusCode).toBe(409);
+    });
+
+    it('says why an approval was refused, not just that it was', async () => {
+      // Risk is deliberately re-run at approval time, so a refusal is an
+      // ordinary outcome and the operator's next question is always "why".
+      // The route used to return the outcome kind and nothing else, which left
+      // the dashboard showing `HTTP 409` — the one thing the operator already
+      // knew from the button not working.
+      const response = await app.inject({
+        method: 'POST', url: '/api/approvals/nonexistent/approve', headers: auth,
+      });
+
+      const body = response.json<{ error: string; outcome: { kind: string } }>();
+      expect(body.outcome.kind).toBe('NO_SIGNAL');
+      expect(body.error).toMatch(/no such staged order/);
     });
 
     it('needs a token to approve', async () => {

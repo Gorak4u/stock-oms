@@ -341,9 +341,20 @@ export async function createApp(): Promise<FastifyInstance> {
     rateLimitPerMinute: optionalNumber('RATE_LIMIT_PER_MINUTE', 300),
     // The scheduler drives the loop here; there is no setInterval to own it.
     onTick: runTick,
+    // Same guarantee as the leader lock on the always-on process, expressed the
+    // way this deployment can: a lease held for the duration of the work. A
+    // manual exit must not race a cron tick that is squaring off the very same
+    // position.
+    withTradingGuard: <T,>(fn: () => Promise<T>): Promise<T | null> =>
+      assembled.lease.withLease(randomUUID(), fn),
     ...(process.env.CRON_SECRET ? { cronSecret: process.env.CRON_SECRET } : {}),
     ...(kiteSession
       ? {
+          brokerSession: () => ({
+            loginUrl: kiteSession.loginUrl,
+            expiresAt: kiteSession.expiresAt,
+            valid: kiteSession.isValid,
+          }),
           onBrokerSession: async (input: {
             requestToken?: string; accessToken?: string; actor: string;
           }) => {

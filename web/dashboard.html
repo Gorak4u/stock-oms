@@ -76,6 +76,12 @@
   }
   .tile dd { margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -0.02em; }
   .pos { color: var(--good-ink); } .neg { color: var(--critical); }
+  .warn { color: var(--warning); }
+  /* Rationales and health details are prose, not figures: they need to wrap
+     rather than force the table into a horizontal scroll. */
+  .why { white-space: normal; line-height: 1.45; max-width: 34ch; color: var(--muted); }
+  .ok-line { color: var(--good-ink); font-size: 13px; margin: 0; }
+  .warn-line { color: var(--warning); font-size: 13px; margin: 0 0 6px; }
 
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; align-items: start; }
   @media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
@@ -207,6 +213,31 @@
     <div class="panel">
       <div class="panel-head"><h2>Closed trades</h2></div>
       <div class="panel-body scroll tall"><div id="trades"></div></div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <div class="panel-head">
+        <h2>System</h2>
+        <span class="eyebrow">Why the loop may not be trading</span>
+      </div>
+      <div class="panel-body scroll"><div id="health"></div></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <h2>Broker session</h2>
+        <span class="eyebrow" id="session-meta"></span>
+      </div>
+      <div class="panel-body">
+        <div id="session-state"></div>
+        <div class="controls" style="margin-top:12px">
+          <input id="request-token" type="text" placeholder="request_token from the login redirect"
+                 autocomplete="off" spellcheck="false" style="flex:1;min-width:220px" />
+          <button type="button" id="submit-token">Set session</button>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -362,29 +393,123 @@
 
   function renderPositions(list) {
     $("positions").innerHTML = table(
-      ["Symbol", "Qty", "Avg", "Last", "Unrealised"],
+      ["Symbol", "Qty", "Avg", "Last", "Unrealised", ""],
       list.map(function (p) {
+        // The only exit an operator can start. A strategy's FLAT signal and the
+        // square-off are decisions the system makes; this is the one that does
+        // not wait for a bar to close.
         return "<tr><td class=\"code\">" + esc(p.symbol) + "</td><td>" + p.quantity +
           "</td><td>" + money(p.averagePriceRupees) + "</td><td>" + money(p.lastPriceRupees) +
           '</td><td class="' + sign(p.unrealisedPnl) + '">' + money(p.unrealisedPnlRupees) +
-          "</td></tr>";
+          '</td><td><button type="button" class="danger" data-flatten="' + esc(p.symbol) +
+          '">Close</button></td></tr>';
       }),
       "Flat — no open positions.",
     );
   }
 
+  // How long ago a signal was staged, in words.
+  //
+  // Age is the first thing to know about an approval: risk is re-checked when
+  // you approve, so a stale one will usually be refused, and the queue holds
+  // them in the order they arrived rather than dropping them.
+  function ago(then) {
+    var seconds = Math.max(0, Math.round((Date.now() - then) / 1000));
+    if (seconds < 90) return seconds + "s ago";
+    var minutes = Math.round(seconds / 60);
+    if (minutes < 90) return minutes + "m ago";
+    var hours = Math.round(minutes / 60);
+    if (hours < 48) return hours + "h ago";
+    return Math.round(hours / 24) + "d ago";
+  }
+
+  // Beyond this an approval is old enough that the market it was computed
+  // against is not the market you would be trading into.
+  var STALE_APPROVAL_MS = 15 * 60 * 1000;
+
   function renderApprovals(list) {
-    $("approvals").innerHTML = table(
-      ["Symbol", "Side", "Qty", ""],
-      list.map(function (a) {
-        return "<tr><td class=\"code\">" + esc(a.symbol) + "</td><td>" + esc(a.side) +
-          "</td><td>" + a.quantity + '</td><td>' +
-          '<button type="button" data-approve="' + esc(a.idempotencyKey) + '">Approve</button> ' +
-          '<button type="button" data-reject="' + esc(a.idempotencyKey) + '">Reject</button>' +
+    // Newest first: the actionable ones are the recent ones, and a long queue
+    // would otherwise bury them under signals from hours ago.
+    var rows = list.slice().sort(function (a, b) { return b.stagedAt - a.stagedAt; });
+    var shown = rows.slice(0, 50);
+
+    $("approvals").innerHTML =
+      (rows.length > shown.length
+        ? '<p class="empty">Showing the 50 most recent of ' + rows.length +
+          " staged orders.</p>"
+        : "") +
+      table(
+        ["Symbol", "Side", "Qty", "Why", "Staged", ""],
+        shown.map(function (a) {
+          // The rationale is the whole reason this row is worth reading:
+          // without it an approval is a quantity and a direction with no case
+          // attached, and the operator is rubber-stamping rather than deciding.
+          var stale = Date.now() - a.stagedAt > STALE_APPROVAL_MS;
+          return "<tr><td class=\"code\">" + esc(a.symbol) + "</td><td>" + esc(a.side) +
+            "</td><td>" + a.quantity +
+            '</td><td style="text-align:left" class="why">' + esc(a.rationale || "—") +
+            '</td><td class="' + (stale ? "warn" : "") + '">' + esc(ago(a.stagedAt)) +
+            "</td><td>" +
+            '<button type="button" data-approve="' + esc(a.idempotencyKey) + '"' +
+            (stale ? ' title="Staged a while ago — risk is re-checked on approval"' : "") +
+            ">Approve</button> " +
+            '<button type="button" data-reject="' + esc(a.idempotencyKey) + '">Reject</button>' +
+            "</td></tr>";
+        }),
+        "Nothing waiting. In Automatic mode orders are not staged.",
+      );
+  }
+
+  // Health is the answer to "why has nothing traded all morning" — a closed
+  // market, an expired calendar, stale data, a broker session needing the daily
+  // login, or this instance not holding the lock. None of it is visible from
+  // the position book, which looks identical in every one of those cases.
+  function renderHealth(report) {
+    var order = { unhealthy: 0, degraded: 1, healthy: 2 };
+    var checks = report.checks.slice().sort(function (a, b) {
+      return (order[a.status] || 3) - (order[b.status] || 3);
+    });
+
+    $("health").innerHTML = table(
+      ["Check", "Status", "Detail"],
+      checks.map(function (c) {
+        var cls = c.status === "healthy" ? "pos" : c.status === "unhealthy" ? "neg" : "warn";
+        return "<tr><td class=\"code\">" + esc(c.name) + '</td><td class="' + cls + '">' +
+          esc(c.status) + '</td><td style="text-align:left" class="why">' + esc(c.detail) +
           "</td></tr>";
       }),
-      "Nothing waiting. In Automatic mode orders are not staged.",
+      "No checks reported.",
     );
+  }
+
+  function renderSession(s) {
+    if (!s.configured) {
+      $("session-meta").textContent = "paper broker";
+      $("session-state").innerHTML =
+        '<p class="empty">No broker session to manage — the paper broker needs no login.</p>';
+      $("request-token").disabled = true;
+      $("submit-token").disabled = true;
+      return;
+    }
+
+    $("request-token").disabled = false;
+    $("submit-token").disabled = false;
+
+    // Kite tokens expire around 07:30 IST and there is no refresh token, so
+    // this is a daily task, not an exceptional one.
+    var expiry = s.expiresAt
+      ? new Date(s.expiresAt).toISOString().slice(0, 16).replace("T", " ") + " UTC"
+      : "unknown";
+
+    $("session-meta").textContent = s.valid ? "valid until " + expiry : "login needed";
+    $("session-state").innerHTML = s.valid
+      ? '<p class="ok-line">Session is valid. Expires ' + esc(expiry) + ".</p>"
+      : '<p class="warn-line">No valid token — the broker will reject orders until you log in.</p>' +
+        (s.loginUrl
+          ? '<p><a href="' + esc(s.loginUrl) + '" target="_blank" rel="noopener">' +
+            "Open the Kite login</a>, then paste the <code>request_token</code> from the " +
+            "redirect URL below.</p>"
+          : "");
   }
 
   function renderOrders(list) {
@@ -483,13 +608,48 @@
       .catch(function (e) { toast(e.message, true); });
   });
 
+  $("positions").addEventListener("click", function (event) {
+    var target = event.target;
+    var symbol = target.getAttribute && target.getAttribute("data-flatten");
+    if (!symbol) return;
+
+    // Confirmed, because it sends a market order against a real position the
+    // instant it is clicked, and there is no undo for a fill.
+    if (!window.confirm("Close the whole " + symbol + " position at market now?")) return;
+
+    target.disabled = true;
+    // Named, so the audit record says who flattened it rather than "api".
+    post("/api/positions/" + encodeURIComponent(symbol) + "/flatten", { actor: "dashboard" })
+      .then(function (r) {
+        toast("Exit sent: " + r.side + " " + r.quantity + " " + r.flattened);
+        refresh();
+      })
+      .catch(function (e) {
+        target.disabled = false;
+        toast(e.message, true);
+      });
+  });
+
+  $("submit-token").addEventListener("click", function () {
+    var value = $("request-token").value.trim();
+    if (!value) return toast("Paste the request_token from the login redirect", true);
+
+    post("/api/broker/session", { requestToken: value, actor: "dashboard" })
+      .then(function () {
+        $("request-token").value = "";
+        toast("Broker session updated — no restart needed");
+        refresh();
+      })
+      .catch(function (e) { toast(e.message, true); });
+  });
+
   $("approvals").addEventListener("click", function (event) {
     var target = event.target;
     var approve = target.getAttribute && target.getAttribute("data-approve");
     var reject = target.getAttribute && target.getAttribute("data-reject");
 
     if (approve) {
-      post("/api/approvals/" + encodeURIComponent(approve) + "/approve")
+      post("/api/approvals/" + encodeURIComponent(approve) + "/approve", { actor: "dashboard" })
         .then(function () { toast("Order submitted"); refresh(); })
         .catch(function (e) { toast(e.message, true); });
     } else if (reject) {
@@ -514,6 +674,10 @@
       get("/api/status"), get("/api/positions"), get("/api/approvals"),
       get("/api/orders?limit=40"), get("/api/trades?limit=40"),
       get("/api/equity"), get("/api/reconciliation"),
+      // /health needs no token and answers with 503 when unhealthy, which `get`
+      // treats as a failure — so it is fetched separately below rather than
+      // being allowed to fail the whole batch.
+      get("/api/broker/session"),
     ]).then(function (r) {
       renderStatus(r[0]);
       renderPositions(r[1].positions);
@@ -522,6 +686,7 @@
       renderTrades(r[4].trades);
       renderEquity(r[5].curve);
       renderBreaks(r[6].breaks);
+      renderSession(r[7]);
     }).catch(function (e) {
       if (e.message === "unauthorised") {
         return toast("Enter the API token to load the dashboard", true);
@@ -536,6 +701,16 @@
       }
       toast("Refresh failed: " + e.message, true);
     });
+
+    // /health is open and answers 503 when unhealthy, which is a body worth
+    // rendering rather than an error to swallow — that is exactly the moment
+    // an operator needs to see which check failed.
+    fetch(api("/health"))
+      .then(function (r) { return r.json(); })
+      .then(renderHealth)
+      .catch(function () {
+        $("health").innerHTML = '<p class="empty">Health endpoint unreachable.</p>';
+      });
   }
 
   var socket = null;

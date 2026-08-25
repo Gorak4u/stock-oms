@@ -154,7 +154,7 @@ See **[DEPLOYMENT.md](DEPLOYMENT.md)**.
 npm install
 npm run typecheck
 npm run lint
-npm test                # 731 tests
+npm test                # 740 tests
 npm run build && npm start
 
 npm run backtest -- --csv ./data/daily.csv    # or --symbol NSE:RELIANCE
@@ -380,6 +380,21 @@ State controls reject; size controls scale the quantity down. Trading less is a
 sensible response to "this order is too big", but not to "the system should not
 be trading at all".
 
+**The stop is a sizing input, not a resting order.** "Stop-loss required" means
+an entry with no stop is refused, and the stop distance is what sizes the
+position — it is *not* an `SL-M` parked at the exchange. Every order this
+platform sends is `MARKET`. A position is closed when the strategy says so at a
+bar close, when the square-off runs before the session ends, or when an operator
+closes it from the dashboard; nothing at the broker protects it in between. If
+the process is down, or the market gaps through the level between two bars, the
+stop does not exist. Placing a protective order alongside each entry fill is the
+obvious next step and is not built.
+
+**The emergency stop is not an exit.** It blocks orders that open exposure and
+deliberately leaves open positions alone — a control that force-liquidated on
+engagement would turn a precaution into a market order at the worst moment. To
+be flat, close the positions.
+
 ## API
 
 Every route needs `Authorization: Bearer $API_TOKEN` except `/health` and
@@ -397,8 +412,10 @@ Every route needs `Authorization: Bearer $API_TOKEN` except `/health` and
 | `POST /api/mode` | Change automation mode |
 | `POST /api/risk/kill-switch` | Engage or release the emergency stop |
 | `GET /api/approvals` · `POST /api/approvals/:key/{approve,reject}` | Approval queue |
+| `POST /api/positions/:symbol/flatten` | Close one position at market, now |
 | `GET /api/audit` | Audit records and chain verification |
 | `GET /api/reconciliation` | Open breaks against the broker |
+| `GET /api/broker/session` | Whether a login is needed, and the login URL |
 | `POST /api/broker/session` | Supply the day's Kite `requestToken` or `accessToken` |
 | `POST /api/backtest` | Backtest a stored symbol |
 | `WS /ws?token=…` | Live status stream (best-effort) |
@@ -422,6 +439,56 @@ With no valid token the process still starts and serves the API — that is the
 only way an operator can supply one. It reports `broker-session` as unhealthy
 until they do.
 
+## Operating it
+
+Everything an operator does day to day is on the dashboard at `/`; the API
+routes below are what it calls, not a second interface you are expected to use
+by hand.
+
+| Task | Where |
+| --- | --- |
+| See what the strategy wants to do, and why | **Pending approvals** — symbol, side, quantity, the signal's own rationale, and how long ago it was staged |
+| Let orders through | **Controls** — Manual, Approval, Automatic |
+| Send a staged order | **Approve** — risk is re-run first, and a refusal says which control refused it |
+| Close a position now | **Close**, on the position's row |
+| Halt new risk | **Emergency stop** — blocks orders that open exposure, leaves positions open |
+| See why nothing is trading | **System** — database, broker, audit chain, leadership, calendar, market data |
+| The daily Kite login | **Broker session** — follow the login link, paste the `request_token` |
+
+The **System** panel is the one worth knowing about before you need it. A quiet
+loop looks identical whether the market is closed, the calendar has expired, the
+data has gone stale, the broker session needs its daily login, or this instance
+is a follower — and the position book shows exactly the same thing in all five
+cases.
+
+Signals reach the dashboard only when the loop is actually running: the session
+is open, this process holds the leader lock, the `candle` table has bars at the
+configured `BAR_INTERVAL`, and a market data provider is configured. On
+`BROKER=paper` there is no provider, and the log says so at startup.
+
+### Closing a position by hand
+
+The **Close** button is the only exit an operator can start. It sends a market
+order for the whole position immediately and is not staged for approval even in
+`APPROVAL` mode — staging exists so a human reviews an order the *system*
+proposed, and an order the human just asked for has already had that review.
+
+It is refused, with the reason, when there is no position, when an order is
+already working on that symbol (two clicks are two intents and would place two
+orders), and on any instance that does not hold the trading lock. Every use is
+written to the audit log as `MANUAL_EXIT` with the actor, before the order is
+sent.
+
+### Approvals accumulate
+
+A staged approval is kept until it is approved or rejected, and a new signal on
+the same symbol stages another rather than replacing it. Over a long unattended
+run the queue grows without bound, and because risk is re-run at approval time,
+old entries are refused anyway — usually with `MARKET_CLOSED` or a stale-data
+rejection. The dashboard sorts newest first, shows each entry's age, and renders
+the 50 most recent, so the actionable ones stay at the top. Expiring them
+outright is a policy decision that has not been made.
+
 ## Backtest console
 
 Served at **`/console`** by the running platform — the same application, not a
@@ -439,7 +506,7 @@ asserts the two agree byte for byte, including at the padding boundaries.
 
 ## Testing
 
-731 tests. The parts worth calling out:
+740 tests. The parts worth calling out:
 
 - **One contract suite, two implementations.** The in-memory and Postgres
   repositories run the same 45 cases, so a divergence fails the build. It has
@@ -513,7 +580,8 @@ Built and tested:
       to durable alert delivery
 - [x] Monitoring — metrics, health checks, alerting, trade reconciliation
 - [x] API — REST, WebSocket, token auth on every route, rate limiting, CORS
-- [x] Operator dashboard
+- [x] Operator dashboard — every day-to-day action, including the manual exit,
+      the daily broker login and a health panel that says why the loop is quiet
 - [x] Live trading runner with session awareness, square-off and a drained
       shutdown
 - [x] Containers — Dockerfile and docker-compose

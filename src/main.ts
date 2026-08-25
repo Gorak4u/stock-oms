@@ -517,8 +517,18 @@ export async function main(): Promise<void> {
     publicReads: optionalBoolean('API_PUBLIC_READS', false),
     corsOrigins: optionalList('CORS_ORIGINS'),
     rateLimitPerMinute: optionalNumber('RATE_LIMIT_PER_MINUTE', 300),
+    // Only the leader may place an order. A follower still serves this route's
+    // dashboard, so without the gate an operator looking at the wrong tab could
+    // send a second exit for one position.
+    withTradingGuard: async <T,>(fn: () => Promise<T>): Promise<T | null> =>
+      leader.isLeader ? await fn() : null,
     ...(kiteSession
       ? {
+          brokerSession: () => ({
+            loginUrl: kiteSession.loginUrl,
+            expiresAt: kiteSession.expiresAt,
+            valid: kiteSession.isValid,
+          }),
           onBrokerSession: async (input: {
             requestToken?: string; accessToken?: string; actor: string;
           }) => {

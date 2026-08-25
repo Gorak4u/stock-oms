@@ -26,6 +26,13 @@ export type AuditEventType =
   | 'ORDER_CANCELLED'
   | 'FILL_RECEIVED'
   | 'POSITION_CLOSED'
+  /**
+   * An operator closed a position by hand, rather than a strategy or the
+   * square-off deciding to. Distinct from `ORDER_SUBMITTED` because "who
+   * flattened this, and when" is a question asked after an incident, and the
+   * answer must not have to be inferred from an order's strategyId.
+   */
+  | 'MANUAL_EXIT'
   | 'KILL_SWITCH_ENGAGED'
   | 'KILL_SWITCH_RELEASED'
   | 'BREAKER_TRIPPED'
