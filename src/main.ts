@@ -13,10 +13,17 @@
  * 5. Ingest market data, then start the loop that consumes it.
  *
  * Starting the loop earlier would let it decide against a portfolio that had
- * not finished loading, or against candles that had not arrived. It also starts
- * in whatever automation mode was persisted, defaulting to MANUAL: a process
- * that came up in AUTOMATIC after a crash — trading before anyone had looked at
- * why it crashed — is a failure mode worth designing out.
+ * not finished loading, or against candles that had not arrived.
+ *
+ * It resumes whatever automation mode was persisted, defaulting to MANUAL only
+ * when nothing was stored. That means a process whose operator had selected
+ * AUTOMATIC comes back up in AUTOMATIC, including after a crash — deliberately,
+ * because the alternative is a silent demotion that leaves a system an operator
+ * believes is trading doing nothing at all, which is the more dangerous of the
+ * two silences. The stop that *is* honoured across a restart is the explicit
+ * one: an engaged kill switch is restored and blocks every risk-increasing
+ * order until a human clears it. Restarting is therefore not a way to halt
+ * trading; engaging the kill switch is.
  */
 
 import Redis from 'ioredis';
@@ -353,6 +360,15 @@ export async function main(): Promise<void> {
 
   const health = new HealthMonitor();
 
+  const databaseReachable = async (): Promise<boolean> => {
+    try {
+      await database.pool.query('SELECT 1');
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
   health.register('database', async () => {
     await database.pool.query('SELECT 1');
     return { status: 'healthy', detail: 'reachable' };
@@ -400,11 +416,22 @@ export async function main(): Promise<void> {
       : { status: 'unhealthy', detail: `chain broken at sequence ${broken}` };
   });
 
-  health.register('leader', async () =>
-    leader.isLeader
-      ? { status: 'healthy', detail: 'holds the trading lock' }
-      : { status: 'degraded', detail: 'read-only; another instance is trading' },
-  );
+  // Not holding the lock has two very different causes, and saying the wrong
+  // one sends an incident in the wrong direction: a follower behind a healthy
+  // leader is a rolling deploy working as intended, while a follower that
+  // cannot reach the database is an outage in which *nobody* is trading. The
+  // message used to assert the first unconditionally, so a database that had
+  // gone away reported "another instance is trading" — reassuring, and wrong.
+  health.register('leader', async () => {
+    if (leader.isLeader) return { status: 'healthy', detail: 'holds the trading lock' };
+
+    return {
+      status: 'degraded',
+      detail: (await databaseReachable())
+        ? 'read-only; another instance holds the trading lock'
+        : 'read-only; the database is unreachable, so no instance may be trading',
+    };
+  });
 
   // Unhealthy rather than degraded: an uncovered year is not reduced capability,
   // it is a process that will never trade again until someone changes the
@@ -480,7 +507,7 @@ export async function main(): Promise<void> {
 
   // ---- api -----------------------------------------------------------------
 
-  const app = buildServer({
+  const app = await buildServer({
     service,
     repositories,
     metrics,

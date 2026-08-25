@@ -73,10 +73,15 @@ already produced — it cannot originate a trade, pick a direction, or enlarge a
 position. It also fails *open*: no promoted model, a thrown exception, missing
 features or detected drift all pass the signal through untouched.
 
-**The audit log is append-only in the database.** A trigger rejects `UPDATE` and
-`DELETE` on `audit_record`, so a mistake in application code cannot rewrite
-history. Records are hash-chained, and the chain **continues across restarts**
-rather than forking.
+**The audit log is append-only in the database.** Triggers reject `UPDATE`,
+`DELETE` *and* `TRUNCATE` on `audit_record`, so a mistake in application code
+cannot rewrite history. `TRUNCATE` needs its own statement-level trigger —
+Postgres never fires a row-level one for it — and it was the gap that mattered
+most, because it takes the whole chain in a single statement rather than one
+record. Records are hash-chained, and the chain **continues across restarts**
+rather than forking. Test fixtures that need a clean table lift the guard
+explicitly, in a helper named for it, rather than the guard being weakened to
+accommodate them.
 
 **State survives restarts, including the emergency stop.** The portfolio is
 rebuilt by replaying stored fills, never by trusting a stored position row — so
@@ -149,7 +154,7 @@ See **[DEPLOYMENT.md](DEPLOYMENT.md)**.
 npm install
 npm run typecheck
 npm run lint
-npm test                # 724 tests
+npm test                # 731 tests
 npm run build && npm start
 
 npm run backtest -- --csv ./data/daily.csv    # or --symbol NSE:RELIANCE
@@ -319,7 +324,11 @@ account place two orders for one intent, and per-instance idempotency keys do
 not prevent it, because each derives its own key from its own decision.
 
 Leadership is checked every tick, not once at startup, so a leader that loses
-its database connection goes quiet rather than becoming a second writer.
+its database connection goes quiet rather than becoming a second writer. Quiet,
+and still running: the lock-holding connection has its own error handler, so a
+failover or an administrative disconnect makes the process stand down, report a
+critical alert, keep serving reads, and re-contend when the database returns —
+rather than exiting mid-tick.
 
 ### Schema changes
 
@@ -430,7 +439,7 @@ asserts the two agree byte for byte, including at the padding boundaries.
 
 ## Testing
 
-724 tests. The parts worth calling out:
+731 tests. The parts worth calling out:
 
 - **One contract suite, two implementations.** The in-memory and Postgres
   repositories run the same 45 cases, so a divergence fails the build. It has
@@ -461,6 +470,28 @@ regressions: an empty CSV price cell parsing as ₹0 rather than being skipped;
 advisory-lock key above 2³¹ splitting across `classid`/`objid` in `pg_locks`, so
 the leader's own heartbeat concluded it had lost a lock it still held — and
 stood down, producing the two leaders the lock exists to prevent.
+
+Three more found by driving the built artefacts end to end against a local
+Postgres, all of which every existing test passed straight through:
+
+- **The rate limiter was applied to nothing.** `register()` defers a plugin
+  until boot, so routes declared synchronously afterwards were built before the
+  limiter's hook existed. Every route answered uncapped, with no
+  `x-ratelimit-*` headers, while the configuration said 300 a minute. Nothing
+  errored, which is why nothing noticed.
+- **Losing the database killed the process.** The advisory lock is held by a
+  connection checked out of the pool and never returned, so `pool.on('error')`
+  — which fires only for clients idle *in* the pool — never saw its failures. A
+  failover, an admin `pg_terminate_backend` or a maintenance restart emitted an
+  unhandled `'error'` and took the trading loop down mid-tick, skipping the
+  drain that exists to avoid exiting between "order persisted" and "broker
+  acknowledged". It now stands down and re-contends, which is what the
+  single-writer section already claimed it did.
+- **`TRUNCATE` walked through the append-only guarantee.** Covered above.
+
+A fourth was a health message rather than a defect: a follower reported
+"another instance is trading" whether or not there was one, so a database
+outage — in which *nobody* is trading — read as a healthy rolling deploy.
 
 ## Roadmap
 

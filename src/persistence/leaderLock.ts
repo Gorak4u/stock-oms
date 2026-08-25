@@ -29,7 +29,7 @@ import type { Pool, PoolClient } from 'pg';
  * it, stood down, and let a second instance take over: two leaders, which is
  * the exact thing this file exists to prevent.
  */
-const TRADING_LEADER_KEY = 1_954_723_902;
+export const TRADING_LEADER_KEY = 1_954_723_902;
 
 export interface LeaderLockOptions {
   /** How often to verify the connection still holds the lock. */
@@ -51,6 +51,14 @@ export interface LeaderLockOptions {
 
 export class LeaderLock {
   private client: PoolClient | null = null;
+  /**
+   * Kept by reference so it can be detached again.
+   *
+   * Only this handler is removed on a clean release — never
+   * `removeAllListeners('error')`, which would also strip the pool's own
+   * handling from a connection that is about to be reused.
+   */
+  private onClientError: ((error: Error) => void) | null = null;
   private heartbeat: NodeJS.Timeout | null = null;
   private retry: NodeJS.Timeout | null = null;
   private held = false;
@@ -100,6 +108,25 @@ export class LeaderLock {
     // Held for the lifetime of this client, so it is never returned to the
     // pool — releasing it would hand the lock-holding session to someone
     // else, and the lock with it.
+    //
+    // Because it stays checked out, `pool.on('error')` never sees its
+    // failures: pg routes that event to the pool only for clients sitting
+    // *idle in the pool*. A checked-out client with no listener of its own
+    // emits an unhandled 'error' the moment the server hangs up — a failover,
+    // an admin `pg_terminate_backend`, a maintenance restart — and Node turns
+    // that into an uncaught exception that kills the whole process. The
+    // trading loop would then die mid-tick, skipping the drain that exists to
+    // avoid exiting between "order persisted" and "broker acknowledged".
+    //
+    // Losing this connection is a real event with a defined response, and it
+    // is the one this class already implements: stand down and re-contend.
+    // The heartbeat below would eventually reach the same conclusion, but only
+    // if the process survives long enough to run it.
+    this.onClientError = (error: Error) => {
+      this.lose(`lock connection error: ${error.message}`);
+    };
+    client.on('error', this.onClientError);
+
     this.client = client;
     this.held = true;
     this.stopRetry();
@@ -180,6 +207,7 @@ export class LeaderLock {
     // Destroy rather than release: the session is in an unknown state, and
     // returning it to the pool would hand out a connection that may still be
     // mid-failure.
+    this.detachClientErrorHandler();
     this.client?.release(true);
     this.client = null;
 
@@ -189,6 +217,13 @@ export class LeaderLock {
     // than a second instance genuinely taking over, so the same process is
     // often the right leader once the database is reachable again.
     this.startRetry();
+  }
+
+  private detachClientErrorHandler(): void {
+    if (this.client && this.onClientError) {
+      this.client.removeListener('error', this.onClientError);
+    }
+    this.onClientError = null;
   }
 
   private stopHeartbeat(): void {
@@ -213,6 +248,7 @@ export class LeaderLock {
     }
 
     const client = this.client;
+    this.detachClientErrorHandler();
     this.client = null;
     this.held = false;
 

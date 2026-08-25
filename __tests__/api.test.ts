@@ -21,7 +21,7 @@ import { PaperBroker } from '../src/execution/paperBroker';
 import { ZERO_COST_SCHEDULE } from '../src/execution/costs';
 import { HealthMonitor } from '../src/monitoring/metrics';
 import { MarketCalendar } from '../src/marketdata/calendar';
-import { announceUnavailable } from './support/infra';
+import { announceUnavailable, resetSchema } from './support/infra';
 
 const TOKEN = 'test-token-that-is-long-enough';
 const DATABASE_URL =
@@ -74,11 +74,7 @@ describe('API', () => {
         database = new Database(DATABASE_URL);
         await database.migrate();
       }
-      await database.pool.query(`
-        TRUNCATE trading.fill, trading."order", trading.closed_trade, trading.position,
-                 trading.equity_point, trading.audit_record, trading.candle,
-                 trading.model, trading.runtime_state, trading.reconciliation_break
-        RESTART IDENTITY CASCADE`);
+      await resetSchema(database.pool);
       repositories = database.repositories();
     } else {
       repositories = memoryRepositories();
@@ -92,7 +88,7 @@ describe('API', () => {
     });
     await service.start();
 
-    app = buildServer({
+    app = await buildServer({
       service,
       repositories,
       metrics: service.metrics,
@@ -170,7 +166,7 @@ describe('API', () => {
     });
 
     it('serves reads unauthenticated when publicReads is set', async () => {
-      const open = buildServer({
+      const open = await buildServer({
         service,
         repositories,
         metrics: service.metrics,
@@ -381,10 +377,76 @@ describe('API', () => {
 
   // ---- cors --------------------------------------------------------------
 
+  describe('rate limiting', () => {
+    /**
+     * The limiter was configured correctly and applied to nothing.
+     *
+     * `app.register()` defers a plugin until boot, so routes declared
+     * synchronously afterwards were built before the limiter's `onRequest`
+     * hook existed and never acquired it: every route answered without a cap
+     * and without an `x-ratelimit-*` header, while the configuration, the
+     * README and `RATE_LIMIT_PER_MINUTE` all said 300 a minute. Nothing failed
+     * — which is why nothing caught it.
+     *
+     * Asserting the headers as well as the 429 matters: their absence is the
+     * signal that the plugin is not in the request path at all, and it is
+     * visible on the very first request rather than only once a cap is hit.
+     */
+    async function limited(max: number): Promise<FastifyInstance> {
+      return buildServer({
+        service, repositories, metrics: service.metrics,
+        health: new HealthMonitor(), authToken: TOKEN,
+        rateLimitPerMinute: max,
+      });
+    }
+
+    it('caps requests at the configured rate and advertises the limit', async () => {
+      const server = await limited(3);
+      await server.ready();
+
+      try {
+        const first = await server.inject({ method: 'GET', url: '/api/status', headers: auth });
+        expect(first.statusCode).toBe(200);
+        expect(first.headers['x-ratelimit-limit']).toBe('3');
+
+        const codes: number[] = [first.statusCode];
+        for (let i = 0; i < 5; i += 1) {
+          codes.push(
+            (await server.inject({ method: 'GET', url: '/api/status', headers: auth })).statusCode,
+          );
+        }
+
+        expect(codes.filter((c) => c === 200)).toHaveLength(3);
+        expect(codes.filter((c) => c === 429)).toHaveLength(3);
+      } finally {
+        await server.close();
+      }
+    });
+
+    it('never throttles health or metrics', async () => {
+      // Infrastructure polls both continuously and presents no token. A
+      // rate-limited health check reads as an outage and takes the instance
+      // out of the load balancer for a fault that does not exist.
+      const server = await limited(2);
+      await server.ready();
+
+      try {
+        for (const url of ['/health', '/metrics']) {
+          for (let i = 0; i < 6; i += 1) {
+            const response = await server.inject({ method: 'GET', url });
+            expect(response.statusCode).not.toBe(429);
+          }
+        }
+      } finally {
+        await server.close();
+      }
+    });
+  });
+
   describe('CORS', () => {
     const CDN = 'https://stock-oms.vercel.app';
 
-    function withCors(origins: string[]): FastifyInstance {
+    async function withCors(origins: string[]): Promise<FastifyInstance> {
       return buildServer({
         service, repositories, metrics: service.metrics,
         health: new HealthMonitor(), authToken: TOKEN,
@@ -405,7 +467,7 @@ describe('API', () => {
       // Every route authenticates with a bearer token, so a preflight that does
       // not permit Authorization fails every cross-origin read while looking
       // like a network fault.
-      const server = withCors([CDN]);
+      const server = await withCors([CDN]);
       await server.ready();
 
       try {
@@ -428,7 +490,7 @@ describe('API', () => {
     });
 
     it('allows a configured origin and refuses an unconfigured one', async () => {
-      const server = withCors([CDN]);
+      const server = await withCors([CDN]);
       await server.ready();
 
       try {
@@ -450,7 +512,7 @@ describe('API', () => {
     it('does not let an allowed origin bypass authentication', async () => {
       // CORS decides which origin may *read a response*; it is not a grant of
       // access. An allowed origin with no token must still be refused.
-      const server = withCors([CDN]);
+      const server = await withCors([CDN]);
       await server.ready();
 
       try {
@@ -466,7 +528,7 @@ describe('API', () => {
     it('does not allow credentialed requests', async () => {
       // The token travels in a header, not a cookie. Allowing credentials would
       // widen what a hostile page could do with an existing session for nothing.
-      const server = withCors([CDN]);
+      const server = await withCors([CDN]);
       await server.ready();
 
       try {
@@ -517,7 +579,7 @@ describe('API', () => {
     let base: string;
 
     beforeEach(async () => {
-      listening = buildServer({
+      listening = await buildServer({
         service, repositories, metrics: service.metrics,
         health: new HealthMonitor(), authToken: TOKEN,
       });
@@ -555,7 +617,7 @@ describe('API', () => {
     function withSessionHandler(
       handler: (input: { requestToken?: string; accessToken?: string; actor: string }) =>
         Promise<{ expiresAt: number | null }>,
-    ): FastifyInstance {
+    ): Promise<FastifyInstance> {
       return buildServer({
         service, repositories, metrics: service.metrics,
         health: new HealthMonitor(), authToken: TOKEN,
@@ -581,7 +643,7 @@ describe('API', () => {
 
     it('passes a request token through and reports the expiry', async () => {
       const seen: unknown[] = [];
-      const server = withSessionHandler(async (input) => {
+      const server = await withSessionHandler(async (input) => {
         seen.push(input);
         return { expiresAt: 1_700_000_000_000 };
       });
@@ -603,7 +665,7 @@ describe('API', () => {
 
     it('accepts an access token obtained elsewhere', async () => {
       const seen: unknown[] = [];
-      const server = withSessionHandler(async (input) => {
+      const server = await withSessionHandler(async (input) => {
         seen.push(input);
         return { expiresAt: null };
       });
@@ -623,7 +685,7 @@ describe('API', () => {
     });
 
     it('requires one of the two tokens', async () => {
-      const server = withSessionHandler(async () => ({ expiresAt: null }));
+      const server = await withSessionHandler(async () => ({ expiresAt: null }));
       await server.ready();
 
       try {
@@ -637,7 +699,7 @@ describe('API', () => {
     });
 
     it('reports a rejected exchange as a broker failure, not a bad request', async () => {
-      const server = withSessionHandler(async () => {
+      const server = await withSessionHandler(async () => {
         throw new Error('token exchange failed: invalid request token');
       });
       await server.ready();
@@ -732,7 +794,7 @@ describe('API', () => {
       const health = new HealthMonitor();
       health.register('db', async () => ({ status: 'healthy', detail: 'ok' }));
 
-      const healthy = buildServer({
+      const healthy = await buildServer({
         service, repositories, metrics: service.metrics, health, authToken: TOKEN,
       });
       await healthy.ready();
@@ -747,7 +809,7 @@ describe('API', () => {
       const health = new HealthMonitor();
       health.register('broker', async () => ({ status: 'unhealthy', detail: 'down' }));
 
-      const sick = buildServer({
+      const sick = await buildServer({
         service, repositories, metrics: service.metrics, health, authToken: TOKEN,
       });
       await sick.ready();

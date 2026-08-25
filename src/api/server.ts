@@ -85,7 +85,29 @@ function tokensMatch(provided: string, expected: string): boolean {
   return timingSafeEqual(a, b);
 }
 
-export function buildServer(config: ApiConfig): FastifyInstance {
+/**
+ * Builds the HTTP application.
+ *
+ * Asynchronous because the rate limiter has to be *loaded* before any route is
+ * declared, not merely queued. `register()` defers a plugin to boot, so routes
+ * added synchronously after a bare `register(rateLimit)` were declared before
+ * the plugin's `onRequest` hook existed and never picked it up: every route
+ * served unthrottled, with no `x-ratelimit-*` headers, while the configuration
+ * said 300/minute. Awaiting it loads the plugin first, so the hook is in place
+ * when the routes below are declared.
+ *
+ * The weak-token guard stays synchronous — hence the explicit `Promise` return
+ * type rather than `async` — so a misconfigured token still fails at the call
+ * rather than on an unhandled rejection somewhere downstream.
+ */
+export function buildServer(config: ApiConfig): Promise<FastifyInstance> {
+  if (!config.authToken || config.authToken.length < 16) {
+    throw new Error('authToken must be at least 16 characters — refusing to start with a weak token');
+  }
+  return assembleServer(config);
+}
+
+async function assembleServer(config: ApiConfig): Promise<FastifyInstance> {
   const app = Fastify({
     logger: config.logger ?? false,
     // 1 MiB. A backtest request is a few hundred bytes; anything approaching
@@ -98,13 +120,9 @@ export function buildServer(config: ApiConfig): FastifyInstance {
   });
   const { service, repositories, metrics, health } = config;
 
-  if (!config.authToken || config.authToken.length < 16) {
-    throw new Error('authToken must be at least 16 characters — refusing to start with a weak token');
-  }
+  await app.register(websocket);
 
-  void app.register(websocket);
-
-  void app.register(rateLimit, {
+  await app.register(rateLimit, {
     max: config.rateLimitPerMinute ?? 300,
     timeWindow: '1 minute',
     // Health and metrics are polled continuously by infrastructure that must
@@ -117,7 +135,7 @@ export function buildServer(config: ApiConfig): FastifyInstance {
   // hosted separately from the engine — a CDN in front of a headless API.
   const origins = config.corsOrigins ?? [];
   if (origins.length > 0) {
-    void app.register(cors, {
+    await app.register(cors, {
       origin: [...origins],
       methods: ['GET', 'POST', 'OPTIONS'],
       // Explicit rather than reflected: every route authenticates with a bearer
@@ -535,7 +553,7 @@ export function buildServer(config: ApiConfig): FastifyInstance {
    * Push-only and best-effort: a dashboard that misses a frame redraws on the
    * next one. Nothing that must not be lost travels over this socket.
    */
-  app.register(async (instance) => {
+  await app.register(async (instance) => {
     instance.get('/ws', {
       websocket: true,
       /**

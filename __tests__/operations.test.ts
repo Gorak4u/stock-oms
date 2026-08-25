@@ -17,7 +17,7 @@ import { join } from 'node:path';
 import { Pool } from 'pg';
 
 import { Migrator, MigrationDriftError, loadMigrations } from '../src/persistence/migrator';
-import { LeaderLock } from '../src/persistence/leaderLock';
+import { LeaderLock, TRADING_LEADER_KEY } from '../src/persistence/leaderLock';
 import { Database, databaseOptionsFromEnv } from '../src/persistence/postgres';
 import { KiteSession, nextTokenExpiry } from '../src/execution/kiteSession';
 import { ZerodhaBroker } from '../src/execution/zerodhaBroker';
@@ -344,6 +344,66 @@ describe('databaseOptionsFromEnv', () => {
       await other.release();
     } finally {
       await lock.release();
+    }
+  });
+
+  it('stands down instead of crashing when its connection is terminated', async () => {
+    // Regression, and the most expensive one in this file.
+    //
+    // The lock is held by a client checked *out* of the pool and deliberately
+    // never returned, so `pool.on('error')` — which pg fires only for clients
+    // sitting idle in the pool — never saw its failures. With no listener of
+    // its own, the client emitted an unhandled 'error' the instant the server
+    // hung up, and Node turned that into an uncaught exception that killed the
+    // process: a Postgres failover, an admin `pg_terminate_backend` or a
+    // maintenance restart took the whole trading loop down mid-tick, skipping
+    // the drain that exists precisely so the process does not exit between
+    // "order persisted" and "broker acknowledged".
+    //
+    // The documented behaviour is that a leader which loses its database
+    // connection goes quiet rather than becoming a second writer. Quiet, not
+    // dead — so this asserts it stood down, reported why, and left the process
+    // running to contend again.
+    const lost: string[] = [];
+    const lock = new LeaderLock(pool, {
+      // Long enough that the heartbeat cannot be what notices; the error
+      // handler has to be.
+      heartbeatMs: 60_000,
+      retryIntervalMs: 0,
+      onLost: (reason) => lost.push(reason),
+    });
+
+    const killer = new Pool({ connectionString: DATABASE_URL, max: 1 });
+
+    try {
+      expect(await lock.tryAcquire()).toBe(true);
+
+      await killer.query(
+        `SELECT pg_terminate_backend(pid) FROM pg_locks
+          WHERE locktype = 'advisory' AND classid = 0 AND objid = $1 AND granted`,
+        [TRADING_LEADER_KEY],
+      );
+
+      // The 'error' event lands on the next turns of the event loop.
+      for (let i = 0; i < 50 && lock.isLeader; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+
+      expect(lock.isLeader).toBe(false);
+      expect(lost).toHaveLength(1);
+      expect(lost[0]).toMatch(/lock connection error/);
+
+      // And the lock is genuinely free now, rather than pinned by a session
+      // nobody is watching.
+      const other = new LeaderLock(pool);
+      try {
+        expect(await other.tryAcquire()).toBe(true);
+      } finally {
+        await other.release();
+      }
+    } finally {
+      await lock.release();
+      await killer.end();
     }
   });
 

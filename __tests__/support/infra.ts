@@ -61,3 +61,32 @@ export function announceUnavailable(dependency: string, url: string, suite: stri
 
   console.warn(`${message} Start it, or set the connection URL, to run these tests.`);
 }
+
+/**
+ * Resets every table a suite writes to, between cases.
+ *
+ * `audit_record` needs saying out loud. Migration 004 forbids TRUNCATE on it,
+ * so the whole statement — every table in the list — is refused unless the
+ * guard is lifted first. That is the guard working: wiping a hash-chained
+ * append-only log is exactly the thing it exists to stop, and a test fixture is
+ * not an exception to the rule so much as the one caller with a legitimate
+ * reason to ask for one. So it asks explicitly, here, in a helper named for
+ * what it does, rather than the trigger being weakened to make room for it.
+ *
+ * Wrapped in a transaction so the guard cannot be left off: DDL is
+ * transactional in Postgres, so a throw between the disable and the re-enable
+ * rolls both back along with the truncation.
+ */
+export async function resetSchema(pool: {
+  query: (sql: string) => Promise<unknown>;
+}): Promise<void> {
+  await pool.query(`
+    BEGIN;
+    ALTER TABLE trading.audit_record DISABLE TRIGGER audit_no_truncate;
+    TRUNCATE trading.fill, trading."order", trading.closed_trade, trading.position,
+             trading.equity_point, trading.audit_record, trading.candle,
+             trading.model, trading.runtime_state, trading.reconciliation_break
+      RESTART IDENTITY CASCADE;
+    ALTER TABLE trading.audit_record ENABLE TRIGGER audit_no_truncate;
+    COMMIT;`);
+}

@@ -18,7 +18,7 @@ import type { ClosedTrade } from '../src/execution/portfolio';
 import { DuplicateKeyError, type Repositories } from '../src/persistence/ports';
 import { memoryRepositories } from '../src/persistence/memory';
 import { Database } from '../src/persistence/postgres';
-import { announceUnavailable } from './support/infra';
+import { announceUnavailable, resetSchema } from './support/infra';
 
 const DATABASE_URL =
   process.env.TEST_DATABASE_URL ?? 'postgres://trader:trader@127.0.0.1:5432/trading';
@@ -598,13 +598,9 @@ if (POSTGRES_AVAILABLE) {
         database = new Database(DATABASE_URL);
         await database.migrate();
       }
-      // Truncate between cases so each starts from a known state; RESTART
+      // Reset between cases so each starts from a known state; RESTART
       // IDENTITY keeps generated ids predictable across runs.
-      await database.pool.query(`
-        TRUNCATE trading.fill, trading."order", trading.closed_trade, trading.position,
-                 trading.equity_point, trading.audit_record, trading.candle,
-                 trading.model, trading.runtime_state, trading.reconciliation_break
-        RESTART IDENTITY CASCADE`);
+      await resetSchema(database.pool);
       return database.repositories();
     },
     async () => {
@@ -619,3 +615,79 @@ if (POSTGRES_AVAILABLE) {
     it('requires a reachable database', () => undefined);
   });
 }
+
+// ===========================================================================
+// Append-only enforcement
+//
+// These assert the database refuses what the application must never do,
+// independently of the application. Every guarantee in the audit log rests on
+// records not leaving it: the chain is verified by re-hashing each record
+// against its predecessor, so one removed record breaks verification for every
+// record after it, and a wiped table verifies vacuously.
+// ===========================================================================
+
+(POSTGRES_AVAILABLE ? describe : describe.skip)('audit_record is append-only', () => {
+  let db: Database;
+
+  beforeAll(async () => {
+    db = new Database(DATABASE_URL);
+    await db.migrate();
+  });
+
+  afterAll(async () => {
+    await db.close();
+  });
+
+  beforeEach(async () => {
+    await resetSchema(db.pool);
+    const log = new InMemoryAuditLog();
+    const repos = db.repositories();
+    await repos.audit.append(log.append('MODE_CHANGED', 'c1', { mode: 'MANUAL' }, 1));
+    await repos.audit.append(log.append('ORDER_SUBMITTED', 'c1', { id: 'o1' }, 2));
+  });
+
+  it('rejects an UPDATE', async () => {
+    await expect(
+      db.pool.query("UPDATE trading.audit_record SET type = 'TAMPERED' WHERE sequence = 1"),
+    ).rejects.toThrow(/append-only/);
+  });
+
+  it('rejects a DELETE', async () => {
+    await expect(
+      db.pool.query('DELETE FROM trading.audit_record WHERE sequence = 1'),
+    ).rejects.toThrow(/append-only/);
+  });
+
+  it('rejects a TRUNCATE', async () => {
+    // The row-level trigger from 001 does not cover this: Postgres never fires
+    // FOR EACH ROW for TRUNCATE, because it drops rows without visiting them.
+    // So the one statement that takes the *entire* hash chain in a single shot
+    // was the one the append-only guarantee did not stop. Migration 004 adds
+    // the statement-level trigger that does.
+    await expect(db.pool.query('TRUNCATE trading.audit_record')).rejects.toThrow(/append-only/);
+    await expect(db.pool.query('TRUNCATE trading.audit_record CASCADE')).rejects.toThrow(
+      /append-only/,
+    );
+  });
+
+  it('leaves the records intact after every refused attempt', async () => {
+    // The point of the guard is not that the statements error; it is that
+    // nothing was removed on the way to erroring.
+    for (const sql of [
+      "UPDATE trading.audit_record SET type = 'TAMPERED' WHERE sequence = 1",
+      'DELETE FROM trading.audit_record WHERE sequence = 1',
+      'TRUNCATE trading.audit_record',
+    ]) {
+      await db.pool.query(sql).catch(() => undefined);
+    }
+
+    const { rows } = await db.pool.query<{ count: string }>(
+      'SELECT count(*)::text AS count FROM trading.audit_record',
+    );
+    expect(Number(rows[0]?.count)).toBe(2);
+
+    const head = await db.repositories().audit.head();
+    expect(head?.sequence).toBe(2);
+    expect(head?.type).toBe('ORDER_SUBMITTED');
+  });
+});

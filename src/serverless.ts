@@ -329,7 +329,7 @@ export async function createApp(): Promise<FastifyInstance> {
   const assembled = await assemble();
   const { service, database, metrics, health, kiteSession } = assembled;
 
-  const app = buildServer({
+  const app = await buildServer({
     service,
     repositories: database.repositories(),
     metrics,
