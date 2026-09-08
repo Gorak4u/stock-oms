@@ -195,39 +195,3 @@ export class RedisQueue<T> {
     );
   }
 }
-
-/**
- * Pub/sub fan-out for live updates.
- *
- * Deliberately separate from {@link RedisQueue}: this is best-effort and
- * ephemeral (a dashboard that misses a tick just redraws on the next one),
- * whereas the queue is durable. Conflating the two leads to either a
- * dashboard that blocks order flow, or orders delivered with a dashboard's
- * reliability.
- */
-export class EventBus {
-  constructor(
-    private readonly publisher: Redis,
-    private readonly subscriber: Redis,
-    private readonly channel = 'events',
-  ) {}
-
-  async publish(event: { type: string; payload: unknown }): Promise<void> {
-    await this.publisher.publish(this.channel, JSON.stringify({ ...event, at: Date.now() }));
-  }
-
-  async subscribe(handler: (event: { type: string; payload: unknown; at: number }) => void): Promise<void> {
-    await this.subscriber.subscribe(this.channel);
-    this.subscriber.on('message', (_channel, message) => {
-      try {
-        handler(JSON.parse(message) as { type: string; payload: unknown; at: number });
-      } catch {
-        // A malformed message must not take down the subscriber loop.
-      }
-    });
-  }
-
-  async close(): Promise<void> {
-    await this.subscriber.unsubscribe(this.channel).catch(() => undefined);
-  }
-}

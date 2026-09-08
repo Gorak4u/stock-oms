@@ -17,7 +17,8 @@
     "build": "tsc -p tsconfig.build.json && node scripts/copy-assets.js && node scripts/build-console.js",
     "build:console": "node scripts/build-console.js",
     "build:static": "node scripts/build-static.js",
-    "start": "node dist/main.js"
+    "start": "node dist/main.js",
+    "smoke": "ts-node scripts/smoke-serverless.ts"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",
@@ -36,7 +37,6 @@
   "dependencies": {
     "@fastify/cors": "^11.3.0",
     "@fastify/rate-limit": "^10.3.0",
-    "@fastify/static": "^10.1.2",
     "@fastify/websocket": "^11.3.0",
     "fastify": "^5.11.0",
     "ioredis": "^6.0.0",
